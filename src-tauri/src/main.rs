@@ -81,6 +81,15 @@ struct DropPoll {
     paths: Vec<String>,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportProgress {
+    active: bool,
+    current: u32,
+    total: u32,
+    message: String,
+}
+
 struct Host {
     _library: Library,
     init: InitFn,
@@ -232,6 +241,7 @@ struct AppState {
     gpu: GpuInfo,
     drop_active: AtomicBool,
     pending_drop_paths: Mutex<Vec<PathBuf>>,
+    export_progress: Mutex<ExportProgress>,
 }
 
 struct VideoDecoder {
@@ -324,6 +334,45 @@ fn detect_gpu_info() -> GpuInfo {
             .unwrap_or_else(|| "未检测到 NVIDIA GPU".into()),
         runtime,
         detected,
+    }
+}
+
+fn begin_export_progress(state: &AppState, total: u32) -> Result<(), String> {
+    let mut progress = state
+        .export_progress
+        .lock()
+        .map_err(|_| "导出进度锁定失败")?;
+    if progress.active {
+        return Err("已有导出任务正在进行。".into());
+    }
+    *progress = ExportProgress {
+        active: true,
+        current: 0,
+        total: total.max(1),
+        message: "准备导出…".into(),
+    };
+    Ok(())
+}
+
+fn set_export_progress(state: &AppState, active: bool, current: u32, total: u32, message: String) {
+    if let Ok(mut progress) = state.export_progress.lock() {
+        progress.active = active;
+        progress.current = current;
+        progress.total = total.max(1);
+        progress.message = message;
+    }
+}
+
+fn finish_export_progress<T>(state: &AppState, result: &Result<T, String>, current: u32) {
+    match result {
+        Ok(_) => set_export_progress(state, false, current, current.max(1), "导出完成".into()),
+        Err(error) => set_export_progress(
+            state,
+            false,
+            current,
+            current.max(1),
+            format!("导出失败：{error}"),
+        ),
     }
 }
 
@@ -693,6 +742,15 @@ fn poll_drop(state: tauri::State<'_, AppState>) -> Result<DropPoll, String> {
 }
 
 #[tauri::command]
+fn poll_export_progress(state: tauri::State<'_, AppState>) -> Result<ExportProgress, String> {
+    state
+        .export_progress
+        .lock()
+        .map_err(|_| "导出进度锁定失败".into())
+        .map(|progress| progress.clone())
+}
+
+#[tauri::command]
 async fn media_info(state: tauri::State<'_, AppState>, path: String) -> Result<MediaInfo, String> {
     let source_path = path;
     let path_buf = PathBuf::from(&source_path);
@@ -773,10 +831,16 @@ async fn process_image_data(
 }
 
 #[tauri::command]
-async fn save_data_png(data: String, destination: String) -> Result<(), String> {
-    image_data_uri(&data)?
-        .save(destination)
-        .map_err(|e| e.to_string())
+async fn save_data_png(
+    state: tauri::State<'_, AppState>,
+    data: String,
+    destination: String,
+) -> Result<(), String> {
+    begin_export_progress(&state, 1)?;
+    let result =
+        image_data_uri(&data).and_then(|image| image.save(destination).map_err(|e| e.to_string()));
+    finish_export_progress(&state, &result, u32::from(result.is_ok()));
+    result
 }
 
 #[tauri::command]
@@ -791,38 +855,41 @@ async fn read_image_data(path: String, max_side: u32) -> Result<String, String> 
 
 #[tauri::command]
 async fn save_png(
-    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
     destination: String,
     runtime: String,
     settings: RenderSettings,
 ) -> Result<(), String> {
-    let image = image::open(&path)
-        .map_err(|e| format!("无法读取图片: {e}"))?
-        .to_rgba8();
-    let (w, h) = image.dimensions();
-    let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
-    if host.is_none() {
-        *host = Some(unsafe { Host::load(&state.root, &runtime)? });
-    }
-    let out = unsafe {
-        host.as_mut().unwrap().render(
-            &state.root,
-            &runtime,
-            image.into_raw(),
-            w,
-            h,
-            &settings,
-            true,
-        )?
-    };
-    RgbaImage::from_raw(w, h, out)
-        .ok_or("无效输出")?
-        .save(&destination)
-        .map_err(|e| format!("无法写入 PNG: {e}"))?;
-    let _ = app;
-    Ok(())
+    begin_export_progress(&state, 1)?;
+    let result: Result<(), String> = (|| {
+        let image = image::open(&path)
+            .map_err(|e| format!("无法读取图片: {e}"))?
+            .to_rgba8();
+        let (w, h) = image.dimensions();
+        let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
+        if host.is_none() {
+            *host = Some(unsafe { Host::load(&state.root, &runtime)? });
+        }
+        let out = unsafe {
+            host.as_mut().unwrap().render(
+                &state.root,
+                &runtime,
+                image.into_raw(),
+                w,
+                h,
+                &settings,
+                true,
+            )?
+        };
+        RgbaImage::from_raw(w, h, out)
+            .ok_or("无效输出")?
+            .save(&destination)
+            .map_err(|e| format!("无法写入 PNG: {e}"))?;
+        Ok(())
+    })();
+    finish_export_progress(&state, &result, u32::from(result.is_ok()));
+    result
 }
 
 #[derive(Serialize)]
@@ -874,88 +941,102 @@ async fn export_video(
     runtime: String,
     settings: RenderSettings,
 ) -> Result<u32, String> {
-    let (w, h, _, fps) = video_probe(&path)?;
-    let mut decode = tool("ffmpeg")?
-        .args([
-            "-v", "error", "-i", &path, "-f", "rawvideo", "-pix_fmt", "rgba", "-",
-        ])
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("无法启动 FFmpeg 解码器: {e}"))?;
-    let mut encode = tool("ffmpeg")?
-        .args([
-            "-y",
-            "-v",
-            "error",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgba",
-            "-s",
-            &format!("{w}x{h}"),
-            "-r",
-            &fps.to_string(),
-            "-i",
-            "-",
-            "-an",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            &destination,
-        ])
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("无法启动 FFmpeg 编码器: {e}"))?;
-    let mut reader = decode.stdout.take().ok_or("无法读取视频数据")?;
-    let mut writer = encode.stdin.take().ok_or("无法写入视频数据")?;
-    let mut buffer = vec![0_u8; (w * h * 4) as usize];
-    let mut count = 0;
-    let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
-    if host.is_none() {
-        *host = Some(unsafe { Host::load(&state.root, &runtime)? });
-    }
-    loop {
-        let mut read = 0;
-        while read < buffer.len() {
-            let n = reader
-                .read(&mut buffer[read..])
-                .map_err(|e| e.to_string())?;
-            if n == 0 {
+    let (w, h, total_frames, fps) = video_probe(&path)?;
+    begin_export_progress(&state, total_frames)?;
+    let mut current = 0;
+    let result: Result<u32, String> = (|| {
+        let mut decode = tool("ffmpeg")?
+            .args([
+                "-v", "error", "-i", &path, "-f", "rawvideo", "-pix_fmt", "rgba", "-",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("无法启动 FFmpeg 解码器: {e}"))?;
+        let mut encode = tool("ffmpeg")?
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba",
+                "-s",
+                &format!("{w}x{h}"),
+                "-r",
+                &fps.to_string(),
+                "-i",
+                "-",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                &destination,
+            ])
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("无法启动 FFmpeg 编码器: {e}"))?;
+        let mut reader = decode.stdout.take().ok_or("无法读取视频数据")?;
+        let mut writer = encode.stdin.take().ok_or("无法写入视频数据")?;
+        let mut buffer = vec![0_u8; (w * h * 4) as usize];
+        let mut count = 0;
+        let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
+        if host.is_none() {
+            *host = Some(unsafe { Host::load(&state.root, &runtime)? });
+        }
+        loop {
+            let mut read = 0;
+            while read < buffer.len() {
+                let n = reader
+                    .read(&mut buffer[read..])
+                    .map_err(|e| e.to_string())?;
+                if n == 0 {
+                    break;
+                }
+                read += n;
+            }
+            if read == 0 {
                 break;
             }
-            read += n;
+            if read != buffer.len() {
+                return Err("视频流末尾帧不完整。".into());
+            }
+            let rendered = unsafe {
+                host.as_mut().unwrap().render(
+                    &state.root,
+                    &runtime,
+                    buffer.clone(),
+                    w,
+                    h,
+                    &settings,
+                    count == 0,
+                )?
+            };
+            writer
+                .write_all(&rendered)
+                .map_err(|e| format!("视频编码写入失败: {e}"))?;
+            count += 1;
+            current = count;
+            set_export_progress(
+                &state,
+                true,
+                current,
+                total_frames,
+                format!("正在导出第 {current} / {total_frames} 帧"),
+            );
         }
-        if read == 0 {
-            break;
+        drop(writer);
+        if !decode.wait().map_err(|e| e.to_string())?.success() {
+            return Err("FFmpeg 解码失败。".into());
         }
-        if read != buffer.len() {
-            return Err("视频流末尾帧不完整。".into());
+        if !encode.wait().map_err(|e| e.to_string())?.success() {
+            return Err("FFmpeg 编码失败。".into());
         }
-        let rendered = unsafe {
-            host.as_mut().unwrap().render(
-                &state.root,
-                &runtime,
-                buffer.clone(),
-                w,
-                h,
-                &settings,
-                count == 0,
-            )?
-        };
-        writer
-            .write_all(&rendered)
-            .map_err(|e| format!("视频编码写入失败: {e}"))?;
-        count += 1;
-    }
-    drop(writer);
-    if !decode.wait().map_err(|e| e.to_string())?.success() {
-        return Err("FFmpeg 解码失败。".into());
-    }
-    if !encode.wait().map_err(|e| e.to_string())?.success() {
-        return Err("FFmpeg 编码失败。".into());
-    }
-    Ok(count)
+        Ok(count)
+    })();
+    finish_export_progress(&state, &result, current);
+    result
 }
 
 fn main() {
@@ -1017,6 +1098,12 @@ fn main() {
                 gpu: detect_gpu_info(),
                 drop_active: AtomicBool::new(false),
                 pending_drop_paths: Mutex::new(Vec::new()),
+                export_progress: Mutex::new(ExportProgress {
+                    active: false,
+                    current: 0,
+                    total: 1,
+                    message: String::new(),
+                }),
             });
             Ok(())
         })
@@ -1025,6 +1112,7 @@ fn main() {
             choose_export,
             gpu_info,
             poll_drop,
+            poll_export_progress,
             media_info,
             read_image_data,
             process_image,

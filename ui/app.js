@@ -120,6 +120,40 @@ async function pollNativeDrop() {
 }
 setInterval(pollNativeDrop,120);
 pollNativeDrop();
+let exportBusy=false, exportPollFailureLogged=false;
+const exportButtons=[$('export-current'),$('export-full')];
+function renderExportProgress(progress) {
+  const wrap=$('export-progress-wrap'), bar=$('export-progress'), label=$('export-progress-label');
+  const total=Math.max(0,Number(progress?.total)||0), current=Math.max(0,Number(progress?.current)||0);
+  if(!progress?.active&&!progress?.message&&current===0){wrap.hidden=true;return;}
+  wrap.hidden=false;
+  if(total>0){bar.max=total;bar.value=Math.min(current,total);}else{bar.removeAttribute('value');}
+  const percent=total>0?` ${Math.round(Math.min(1,current/total)*100)}%`:'';
+  label.textContent=`${progress.message||'正在导出…'}${percent}`;
+}
+function showExportProgress(current,total,message) { renderExportProgress({active:true,current,total,message}); }
+async function pollExportProgress() {
+  try {
+    renderExportProgress(await invoke('poll_export_progress'));
+  } catch(e) {
+    if(!exportPollFailureLogged){log(`导出进度: ${e}`);exportPollFailureLogged=true;}
+  }
+}
+setInterval(pollExportProgress,120);
+pollExportProgress();
+function setExportBusy(busy) { exportBusy=busy; exportButtons.forEach(button=>button.disabled=busy); }
+async function runExport(total, task) {
+  setExportBusy(true);
+  showExportProgress(0,total,'准备导出…');
+  try {
+    const result=await task();
+    showExportProgress(total,total,'导出完成');
+    return result;
+  } catch(e) {
+    showExportProgress(0,total,'导出失败');
+    throw e;
+  } finally { setExportBusy(false); }
+}
 let refreshTimer, playHandle=null, playStartedAt=0, playStartedFrame=0;
 let refreshQueued=false, refreshQueuedFit=false;
 function refresh(fit=false, delay=90) {
@@ -186,8 +220,8 @@ function playbackTick(now){
 }
 $('frame').oninput=async event=>{if(event.isTrusted)stopPlayback();$('frame-label').textContent=`帧 ${$('frame').value} / ${$('frame').max}`;await refresh(false,40);};
 $('play').onclick=()=>{if(!state.info||state.kind!=='video')return;if(playHandle!==null){stopPlayback();return;}playStartedAt=performance.now();playStartedFrame=+$('frame').value;$('play').textContent='⏸ 暂停';playHandle=requestAnimationFrame(playbackTick);};
-$('export-current').onclick=async()=>{if(!state.path)return;try{const destination=await invoke('choose_export',{video:false});if(!destination)return;await invoke('save_data_png',{data:await currentImageData(),destination});log(`已导出当前画面: ${destination}`);status('当前画面已导出');}catch(e){log(`当前画面导出失败: ${e}`);status('导出失败');}};
-$('export-full').onclick=async()=>{if(!state.path)return;try{const destination=await invoke('choose_export',{video:state.kind==='video'});if(!destination)return;status('正在按原始分辨率导出…');if(state.kind==='video'){const frames=await invoke('export_video',{path:state.path,destination,runtime:$('runtime').value,settings:settings()});log(`已导出 ${frames} 帧: ${destination}`);}else if(state.kind==='clipboard'){await invoke('save_data_png',{data:state.processed||state.original,destination});log(`已导出: ${destination}`);}else{await invoke('save_png',{path:state.path,destination,runtime:$('runtime').value,settings:settings()});log(`已导出: ${destination}`);}status('导出完成');}catch(e){log(`导出失败: ${e}`);status('导出失败');}};
+$('export-current').onclick=async()=>{if(!state.path||exportBusy)return;try{const destination=await invoke('choose_export',{video:false});if(!destination)return;await runExport(1,async()=>invoke('save_data_png',{data:await currentImageData(),destination}));log(`已导出当前画面: ${destination}`);status('当前画面已导出');}catch(e){log(`当前画面导出失败: ${e}`);status('导出失败');}};
+$('export-full').onclick=async()=>{if(!state.path||exportBusy)return;try{const destination=await invoke('choose_export',{video:state.kind==='video'});if(!destination)return;const total=state.kind==='video'?Math.max(1,state.info?.frames||1):1;await runExport(total,async()=>{status('正在按原始分辨率导出…');if(state.kind==='video'){const frames=await invoke('export_video',{path:state.path,destination,runtime:$('runtime').value,settings:settings()});log(`已导出 ${frames} 帧: ${destination}`);}else if(state.kind==='clipboard'){await invoke('save_data_png',{data:state.processed||state.original,destination});log(`已导出: ${destination}`);}else{await invoke('save_png',{path:state.path,destination,runtime:$('runtime').value,settings:settings()});log(`已导出: ${destination}`);}});status('导出完成');}catch(e){log(`导出失败: ${e}`);status('导出失败');}};
 $('copy').onclick=async()=>{if(!state.path)return;try{await navigator.clipboard.write([new ClipboardItem({'image/png':await(await fetch(await currentImageData())).blob()})]);status('当前画面已复制');}catch(e){log(`复制失败: ${e}`);}};
 document.addEventListener('paste',()=>$('paste').click());
 new ResizeObserver(()=>{if(state.path&&Math.abs(state.zoom-state.fit)<.01)resetFit();updateSplit();}).observe(stage);
