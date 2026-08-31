@@ -6,6 +6,12 @@
 
 ![DLSS5 Neural Render 软件界面](Preview.jpg)
 
+## 最新版本
+
+无需自行编译，直接前往 [Releases](https://github.com/JDui/GUI-DLSS5/releases) 下载最新版
+Windows x64 发布包，解压后运行 `run.bat` 即可。发布包已携带程序、DLSS 运行时以及视频处理所需
+的 FFmpeg / FFprobe。目前支持 NVIDIA GeForce RTX 50 / 40 / 30 系列显卡。
+
 ## 构建
 
 ```powershell
@@ -50,5 +56,6 @@ PowerShell / CMD 的代码页，并会自动固定工作目录，确保程序能
 
 选择目标路径后，可以导出当前视图画面，或按素材类型导出 DLSS 图片 / 视频。
 
-视频与 GIF 的解码以及视频编码依赖系统 PATH 中可用的 FFmpeg / FFprobe。
+发布包已附带 FFmpeg / FFprobe，可直接处理视频与 GIF；从源码运行时需确保系统 PATH 中可用
+FFmpeg / FFprobe。
 程序启动时会清理上次遗留的 `Temp`，正常关闭时也会删除本次临时缓存。

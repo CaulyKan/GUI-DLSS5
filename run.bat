@@ -1,8 +1,16 @@
 @echo off
 setlocal
 pushd "%~dp0"
-set "APP=%CD%\src-tauri\target\release\dlss5-tauri.exe"
+set "PATH=%CD%;%PATH%"
+set "APP=%CD%\dlss5-tauri.exe"
+if exist "%CD%\src-tauri\target\release\dlss5-tauri.exe" set "APP=%CD%\src-tauri\target\release\dlss5-tauri.exe"
 if not exist "%APP%" (
+  if not exist "%CD%\src-tauri\Cargo.toml" (
+    echo Release executable is missing from this folder.
+    pause
+    popd
+    exit /b 1
+  )
   where cargo >nul 2>&1
   if errorlevel 1 (
     echo Build missing and Cargo was not found in PATH.
