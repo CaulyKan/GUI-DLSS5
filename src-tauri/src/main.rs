@@ -22,6 +22,7 @@ use tauri::Manager;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const PREVIEW_CACHE_FRAMES: usize = 12;
 const SEQUENTIAL_DECODE_LIMIT: u32 = 90;
+const MAX_PREVIEW_SIDE: u32 = 2160;
 
 type InitFn = unsafe extern "C" fn(i32, i32, i32, *const u16, *const u16) -> i32;
 type CreateFn = unsafe extern "C" fn(i32, i32, i32) -> i32;
@@ -457,7 +458,7 @@ fn video_probe(path: &str) -> Result<(u32, u32, u32, f64), String> {
 }
 
 fn preview_dimensions(width: u32, height: u32, max_side: u32) -> (u32, u32) {
-    let max_side = max_side.clamp(320, 1600);
+    let max_side = max_side.clamp(320, MAX_PREVIEW_SIDE);
     if width.max(height) <= max_side {
         (width, height)
     } else {
@@ -650,7 +651,7 @@ fn image_data_uri(data: &str) -> Result<RgbaImage, String> {
         .to_rgba8())
 }
 fn preview_size(image: RgbaImage, max_side: u32) -> RgbaImage {
-    let max_side = max_side.clamp(320, 1600);
+    let max_side = max_side.clamp(320, MAX_PREVIEW_SIDE);
     let (w, h) = image.dimensions();
     if w.max(h) <= max_side {
         image

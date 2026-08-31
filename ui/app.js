@@ -1,6 +1,6 @@
 const invoke = window.__TAURI__.core.invoke;
 const $ = id => document.getElementById(id);
-const PREVIEW_MAX_SIDE = 1280;
+const PREVIEW_MAX_SIDE = 2160;
 let runtimeReady = Promise.resolve();
 const state = { path:null, sourcePath:null, kind:null, info:null, original:null, processed:null, zoom:1, fit:1, panX:0, panY:0, splitX:null, dragging:null, request:0, busy:false };
 const stage = $('stage'), preview = $('preview'), originalPreview = $('original-preview'), originalMask = $('original-mask'), abView = $('ab-view');
