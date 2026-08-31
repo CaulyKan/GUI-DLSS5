@@ -1,0 +1,170 @@
+const invoke = window.__TAURI__.core.invoke;
+const $ = id => document.getElementById(id);
+const PREVIEW_MAX_SIDE = 1280;
+const state = { path:null, sourcePath:null, kind:null, info:null, original:null, processed:null, zoom:1, fit:1, panX:0, panY:0, splitX:null, dragging:null, request:0, busy:false };
+const stage = $('stage'), preview = $('preview'), originalPreview = $('original-preview'), originalMask = $('original-mask'), abView = $('ab-view');
+const abPanes = Array.from(abView.querySelectorAll('.ab-pane')), abOriginal = $('ab-original'), abProcessed = $('ab-processed');
+const settings = () => ({ style:+$('style').value, intensity:+$('intensity').value, localTone:+$('tone').value, localStruct:+$('struct').value, outputView:0, outputMix:1 });
+function log(message) { console.debug(`[DLSS5] ${message}`); }
+function status(message) { $('status').textContent = message; }
+function syncControls(range, number) { $(range).oninput = () => { $(number).value = $(range).value; refresh(); }; $(number).onchange = () => { $(range).value = Math.max(0, Math.min(1, +$(number).value || 0)); refresh(); }; }
+syncControls('intensity','intensity-num'); syncControls('tone','tone-num'); syncControls('struct','struct-num');
+function syncAbLayout() {
+  const original = abOriginal, processed = abProcessed;
+  const w = original.naturalWidth || processed.naturalWidth || 1;
+  const h = original.naturalHeight || processed.naturalHeight || 1;
+  [original, processed].forEach(image => {
+    image.style.width = `${w}px`;
+    image.style.height = `${h}px`;
+  });
+  return [w, h];
+}
+function syncCompareLayout() {
+  const w = preview.naturalWidth || originalPreview.naturalWidth || 1;
+  const h = preview.naturalHeight || originalPreview.naturalHeight || 1;
+  [preview, originalPreview].forEach(image => {
+    image.style.width = `${w}px`;
+    image.style.height = `${h}px`;
+  });
+  return [w, h];
+}
+function displayedSize() { if ($('view').value === 'AB 视图') return syncAbLayout(); if ($('view').value === '对比') return syncCompareLayout(); const w = preview.naturalWidth || 1, h = preview.naturalHeight || 1; return [w,h]; }
+function activeViewport() { return $('view').value === 'AB 视图' ? abPanes[0] : stage; }
+function resetFit() { const [w,h] = displayedSize(), viewport = activeViewport(); const width = viewport.clientWidth || stage.clientWidth, height = viewport.clientHeight || stage.clientHeight; state.fit = Math.min(width / w, height / h, 1); state.zoom = state.fit; state.panX = (width - w * state.zoom) / 2; state.panY = (height - h * state.zoom) / 2; transform(); }
+function transform() { const matrix = `translate(${state.panX}px,${state.panY}px) scale(${state.zoom})`; preview.style.transform = matrix; originalPreview.style.transform = matrix; abOriginal.style.transform = matrix; abProcessed.style.transform = matrix; abView.style.transform = 'none'; $('zoom').textContent = `${Math.round(state.zoom * 100)}% · 点击${Math.abs(state.zoom - 1) < .01 ? '适合窗口' : '100%'}`; }
+function updateSplit() { const x = Math.max(0, Math.min(stage.clientWidth, state.splitX ?? stage.clientWidth / 2)); $('split-line').style.left = `${x}px`; originalMask.style.width = `${x}px`; }
+function fitWhenReady(image) {
+  const fit = () => requestAnimationFrame(() => { if ($('view').value === 'AB 视图') syncAbLayout(); else if ($('view').value === '对比') syncCompareLayout(); resetFit(); });
+  if (image.complete && image.naturalWidth) fit();
+  else image.addEventListener('load', fit, {once:true});
+}
+function chooseDisplayed(fit = false) {
+  if (!state.original) return;
+  const view = $('view').value, output = state.processed || state.original;
+  preview.style.display = 'none'; preview.style.width = ''; preview.style.height = ''; originalMask.style.display = 'none'; originalPreview.style.display = 'none'; originalPreview.style.width = ''; originalPreview.style.height = ''; abView.style.display = 'none'; $('split-line').style.display = 'none'; $('compare-left').style.display = 'none'; $('compare-right').style.display = 'none'; $('ab-option').style.display = view === 'AB 视图' ? 'inline-flex' : 'none';
+  if (view === '原图') { preview.src = state.original; preview.style.display = 'block'; }
+  else if (view === 'DLSS') { preview.src = output; preview.style.display = 'block'; }
+  else if (view === '对比') { preview.src = output; originalPreview.src = state.original; syncCompareLayout(); preview.style.display = 'block'; originalMask.style.display = 'block'; originalPreview.style.display = 'block'; $('split-line').style.display = 'block'; $('compare-left').style.display = 'block'; $('compare-right').style.display = 'block'; updateSplit(); }
+  else { abOriginal.src = state.original; abProcessed.src = output; abView.className = $('ab-layout').value; syncAbLayout(); abView.style.display = 'flex'; }
+  $('empty').style.display = 'none'; if (fit) fitWhenReady(view === 'AB 视图' ? $('ab-original') : preview); else transform();
+}
+function loadDataImage(data) { return new Promise((resolve,reject) => { const image=new Image(); image.onload=()=>resolve(image); image.onerror=reject; image.src=data; }); }
+async function currentImageData() {
+  const view = $('view').value; if (view === '原图' || !state.processed) return state.original; if (view === 'DLSS') return state.processed;
+  const original = await loadDataImage(state.original), processed = await loadDataImage(state.processed), ab = view === 'AB 视图', vertical = ab && $('ab-layout').value === 'vertical';
+  const w=original.naturalWidth, h=original.naturalHeight; const canvas=document.createElement('canvas'); canvas.width=ab&&!vertical ? w*2 : w; canvas.height=ab&&vertical ? h*2 : h; const c=canvas.getContext('2d'); c.drawImage(original,0,0,w,h);
+  if(ab) c.drawImage(processed,vertical?0:w,vertical?h:0,w,h); else { const split=Math.max(0,Math.min(w,((state.splitX ?? stage.clientWidth/2)-state.panX)/state.zoom)); c.save();c.beginPath();c.rect(split,0,w-split,h);c.clip();c.drawImage(processed,0,0,w,h);c.restore(); }
+  return canvas.toDataURL('image/png');
+}
+function scaleClipboard(data) { return loadDataImage(data).then(image => { const max=Math.max(image.naturalWidth,image.naturalHeight); if(max<=PREVIEW_MAX_SIDE) return data; const s=PREVIEW_MAX_SIDE/max, canvas=document.createElement('canvas'); canvas.width=Math.round(image.naturalWidth*s); canvas.height=Math.round(image.naturalHeight*s); canvas.getContext('2d').drawImage(image,0,0,canvas.width,canvas.height); return canvas.toDataURL('image/png'); }); }
+let loadingPath='', loadingStarted=0;
+async function loadPath(path) {
+  stopPlayback();
+  status('正在读取素材…');
+  const now=Date.now();
+  if(path===loadingPath&&now-loadingStarted<500)return;
+  loadingPath=path;loadingStarted=now;
+  clearTimeout(refreshTimer);
+  state.request++;
+  refreshQueued=false;
+  refreshQueuedFit=false;
+  const info=await invoke('media_info',{path}); Object.assign(state,{path:info.path,sourcePath:info.sourcePath,kind:info.kind,info,original:null,processed:null,splitX:null});
+  if(info.kind==='video') {
+    status('正在生成首帧预览…');
+    const result=await invoke('preview_video_frame',{path:info.path,frame:0,runtime:$('runtime').value,settings:settings(),maxSide:PREVIEW_MAX_SIDE});
+    state.original=result.original; state.processed=result.processed;
+  } else {
+    state.original=await invoke('read_image_data',{path:info.path,maxSide:PREVIEW_MAX_SIDE});
+  }
+  $('source').textContent=`${path.split(/[\\/]/).pop()} · ${info.kind==='video'?'视频':'图片'} · ${info.width}×${info.height}`; $('frame').max=Math.max(0,info.frames-1); $('frame').value=0; $('frame-label').textContent=`帧 0 / ${Math.max(0,info.frames-1)}`; $('export-full').textContent=info.kind==='video'?'导出 DLSS 视频':'导出 DLSS 图片';
+  chooseDisplayed(true);
+  if(info.kind==='image'){status('正在生成 DLSS 预览…');refresh();}else status('就绪');
+}
+function normalizeDroppedPath(value) { if(typeof value!=='string') return ''; const raw=value.trim(); if(!raw) return ''; if(!raw.toLowerCase().startsWith('file://')) return raw; try { const url=new URL(raw); let path=decodeURIComponent(url.pathname); if(/^\/[A-Za-z]:/.test(path)) path=path.slice(1); if(url.hostname&&url.hostname!=='localhost') path=`\\\\${url.hostname}${path}`; return path; } catch(_) { return raw; } }
+function droppedPaths(payload) { const value=payload?.paths??payload; return Array.isArray(value)?value:(value?[value]:[]); }
+let lastDropPath='', lastDropAt=0;
+async function loadDroppedPath(value) { const path=normalizeDroppedPath(value); if(!path){status('无法读取拖入素材');return;} const now=Date.now(); if(path===lastDropPath&&now-lastDropAt<500)return; lastDropPath=path;lastDropAt=now; try { status('正在读取拖入素材…'); await loadPath(path); } catch(e) { log(`拖放: ${e}`); status('拖放失败'); } }
+function setDropActive(active) { stage.classList.toggle('drop-active',active); }
+['dragenter','dragover'].forEach(type=>document.addEventListener(type,event=>{event.preventDefault();if(event.dataTransfer)event.dataTransfer.dropEffect='copy';setDropActive(true);}));
+document.addEventListener('dragleave',event=>{if(!event.relatedTarget)setDropActive(false);});
+document.addEventListener('drop',event=>{event.preventDefault();event.stopPropagation();setDropActive(false);const file=event.dataTransfer?.files?.[0];const uri=event.dataTransfer?.getData('text/uri-list')?.split(/\r?\n/).find(item=>item&&!item.startsWith('#'));const path=file?.path||uri;if(path)loadDroppedPath(path);});
+let refreshTimer, playHandle=null, playStartedAt=0, playStartedFrame=0;
+let refreshQueued=false, refreshQueuedFit=false;
+function refresh(fit=false, delay=90) {
+  clearTimeout(refreshTimer);
+  const request=++state.request;
+  refreshQueued=true;
+  refreshQueuedFit=refreshQueuedFit||fit;
+  return new Promise(resolve => refreshTimer=setTimeout(async()=>{
+    refreshQueued=false;
+    if(!state.path){refreshQueuedFit=false;resolve();return;}
+    if(state.busy){refreshQueued=true;resolve();return;}
+    state.busy=true;
+    const renderPath=state.path;
+    const renderKind=state.kind;
+    const renderFrame=+$('frame').value;
+    const renderOriginal=state.original;
+    const renderFit=refreshQueuedFit;
+    refreshQueuedFit=false;
+    try {
+      status('正在刷新轻量预览…');
+      let original=renderOriginal, processed;
+      if(renderKind==='video') {
+        const result=await invoke('preview_video_frame',{path:renderPath,frame:renderFrame,runtime:$('runtime').value,settings:settings(),maxSide:PREVIEW_MAX_SIDE});
+        original=result.original; processed=result.processed;
+      } else {
+        processed=await invoke('process_image_data',{data:renderOriginal,runtime:$('runtime').value,settings:settings(),maxSide:PREVIEW_MAX_SIDE});
+      }
+      if(request===state.request&&renderPath===state.path) {
+        if(renderKind==='video')state.original=original;
+        state.processed=processed;
+        chooseDisplayed(renderFit);
+        status('就绪');
+      }
+    } catch(e) {
+      if(request===state.request&&renderPath===state.path){log(`DLSS: ${e}`);status('预览失败');}
+    } finally {
+      state.busy=false;
+      const rerender=refreshQueued;
+      const nextFit=refreshQueuedFit;
+      refreshQueued=false;
+      refreshQueuedFit=false;
+      if(rerender)refresh(nextFit,0);
+      resolve();
+    }
+  },delay));
+}
+$('open').onclick=async()=>{try{const path=await invoke('choose_media');if(path)await loadPath(path);}catch(e){log(String(e));status('导入失败');}};
+$('paste').onclick=async()=>{try{const item=(await navigator.clipboard.read()).find(i=>i.types.some(t=>t.startsWith('image/')));if(!item)throw Error('剪贴板中没有图片');const type=item.types.find(t=>t.startsWith('image/'));const blob=await item.getType(type),reader=new FileReader();reader.onload=async()=>{Object.assign(state,{path:'剪贴板图片',kind:'clipboard',info:{kind:'image',frames:1},original:await scaleClipboard(reader.result),processed:null,splitX:null});$('source').textContent='已粘贴图片（轻量预览）';await refresh(true);};reader.readAsDataURL(blob);}catch(e){log(`粘贴: ${e}`);status('粘贴失败');}};
+$('view').onchange=()=>chooseDisplayed(true); $('ab-layout').onchange=()=>chooseDisplayed(true); $('style').onchange=()=>refresh(); $('runtime').onchange=()=>{log('运行时变更需重启应用后生效。');refresh();};
+  $('zoom').onclick=()=>{if(!state.path)return;if(Math.abs(state.zoom-1)<.01)resetFit();else{const [w,h]=displayedSize(),viewport=activeViewport();state.zoom=1;state.panX=(viewport.clientWidth-w)/2;state.panY=(viewport.clientHeight-h)/2;transform();}};
+ function stagePoint(event) { const rect=stage.getBoundingClientRect(); return {x:Math.max(0,Math.min(stage.clientWidth,event.clientX-rect.left)),y:Math.max(0,Math.min(stage.clientHeight,event.clientY-rect.top))}; }
+ function abAnchor(event) { const pane=abPanes.find(item=>{const rect=item.getBoundingClientRect();return event.clientX>=rect.left&&event.clientX<=rect.right&&event.clientY>=rect.top&&event.clientY<=rect.bottom;})||abPanes[0]; const rect=pane.getBoundingClientRect(); const x=rect.width?Math.max(0,Math.min(1,(event.clientX-rect.left)/rect.width)):0.5; const y=rect.height?Math.max(0,Math.min(1,(event.clientY-rect.top)/rect.height)):0.5; return {x:x*abPanes[0].clientWidth,y:y*abPanes[0].clientHeight}; }
+ function zoomAt(event) { const old=state.zoom, zoom=Math.max(.1,Math.min(6,old*(event.deltaY<0?1.15:1/1.15))); const point=$('view').value==='AB 视图'?abAnchor(event):stagePoint(event); state.panX=point.x-(point.x-state.panX)*(zoom/old); state.panY=point.y-(point.y-state.panY)*(zoom/old); state.zoom=zoom; transform(); }
+ stage.addEventListener('wheel',e=>{if(!state.path)return;e.preventDefault();zoomAt(e);},{passive:false});
+ stage.addEventListener('pointerdown',event=>{if(event.button===0&&$('view').value==='对比'){state.splitX=stagePoint(event).x;state.dragging={kind:'split'};stage.setPointerCapture(event.pointerId);updateSplit();return;}if(event.button===1||event.button===2){state.dragging={kind:'pan',x:event.clientX,y:event.clientY,px:state.panX,py:state.panY};stage.setPointerCapture(event.pointerId);}});stage.addEventListener('pointermove',event=>{if(state.dragging?.kind==='split'){state.splitX=stagePoint(event).x;updateSplit();}else if(state.dragging?.kind==='pan'){state.panX=state.dragging.px+event.clientX-state.dragging.x;state.panY=state.dragging.py+event.clientY-state.dragging.y;transform();}});stage.addEventListener('pointerup',event=>{if(stage.hasPointerCapture(event.pointerId))stage.releasePointerCapture(event.pointerId);state.dragging=null;});stage.addEventListener('pointercancel',event=>{if(stage.hasPointerCapture(event.pointerId))stage.releasePointerCapture(event.pointerId);state.dragging=null;});stage.oncontextmenu=e=>e.preventDefault();
+function stopPlayback(){if(playHandle!==null){cancelAnimationFrame(playHandle);playHandle=null;}$('play').textContent='▶ 播放';}
+function playbackTick(now){
+  if(playHandle===null)return;
+  const total=+$('frame').max+1, fps=state.info?.fps||30;
+  const target=(playStartedFrame+Math.floor((now-playStartedAt)*fps/1000))%Math.max(1,total);
+  if(!state.busy&&target!==+$('frame').value){$('frame').value=target;$('frame-label').textContent=`帧 ${target} / ${$('frame').max}`;refresh(false,0);}
+  playHandle=requestAnimationFrame(playbackTick);
+}
+$('frame').oninput=async event=>{if(event.isTrusted)stopPlayback();$('frame-label').textContent=`帧 ${$('frame').value} / ${$('frame').max}`;await refresh(false,40);};
+$('play').onclick=()=>{if(!state.info||state.kind!=='video')return;if(playHandle!==null){stopPlayback();return;}playStartedAt=performance.now();playStartedFrame=+$('frame').value;$('play').textContent='⏸ 暂停';playHandle=requestAnimationFrame(playbackTick);};
+$('export-current').onclick=async()=>{if(!state.path)return;try{const destination=await invoke('choose_export',{video:false});if(!destination)return;await invoke('save_data_png',{data:await currentImageData(),destination});log(`已导出当前画面: ${destination}`);status('当前画面已导出');}catch(e){log(`当前画面导出失败: ${e}`);status('导出失败');}};
+$('export-full').onclick=async()=>{if(!state.path)return;try{const destination=await invoke('choose_export',{video:state.kind==='video'});if(!destination)return;status('正在按原始分辨率导出…');if(state.kind==='video'){const frames=await invoke('export_video',{path:state.path,destination,runtime:$('runtime').value,settings:settings()});log(`已导出 ${frames} 帧: ${destination}`);}else if(state.kind==='clipboard'){await invoke('save_data_png',{data:state.processed||state.original,destination});log(`已导出: ${destination}`);}else{await invoke('save_png',{path:state.path,destination,runtime:$('runtime').value,settings:settings()});log(`已导出: ${destination}`);}status('导出完成');}catch(e){log(`导出失败: ${e}`);status('导出失败');}};
+$('copy').onclick=async()=>{if(!state.path)return;try{await navigator.clipboard.write([new ClipboardItem({'image/png':await(await fetch(await currentImageData())).blob()})]);status('当前画面已复制');}catch(e){log(`复制失败: ${e}`);}};
+document.addEventListener('paste',()=>$('paste').click());
+new ResizeObserver(()=>{if(state.path&&Math.abs(state.zoom-state.fit)<.01)resetFit();updateSplit();}).observe(stage);
+function handleNativeDrop(event){const type=event.payload?.type;if(type==='enter'||type==='over')setDropActive(true);else if(type==='leave')setDropActive(false);else if(type==='drop'){setDropActive(false);const paths=droppedPaths(event.payload);if(paths[0])loadDroppedPath(paths[0]);}}
+async function installNativeDrop(){
+  const currentWebview=window.__TAURI__?.webview?.getCurrentWebview?.();
+  const currentWindow=window.__TAURI__?.window?.getCurrentWindow?.();
+  for(const target of [currentWebview,currentWindow]){
+    if(!target?.onDragDropEvent)continue;
+    try{await target.onDragDropEvent(handleNativeDrop);return;}catch(error){log(`拖放监听: ${error}`);}
+  }
+}
+installNativeDrop();

@@ -1,0 +1,5 @@
+/__pycache__/
+/src-tauri/target/
+/dlss_run.log
+/dist/
+/Temp/
