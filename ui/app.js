@@ -1,6 +1,7 @@
 const invoke = window.__TAURI__.core.invoke;
 const $ = id => document.getElementById(id);
 const PREVIEW_MAX_SIDE = 1280;
+let runtimeReady = Promise.resolve();
 const state = { path:null, sourcePath:null, kind:null, info:null, original:null, processed:null, zoom:1, fit:1, panX:0, panY:0, splitX:null, dragging:null, request:0, busy:false };
 const stage = $('stage'), preview = $('preview'), originalPreview = $('original-preview'), originalMask = $('original-mask'), abView = $('ab-view');
 const abPanes = Array.from(abView.querySelectorAll('.ab-pane')), abOriginal = $('ab-original'), abProcessed = $('ab-processed');
@@ -58,7 +59,26 @@ async function currentImageData() {
 }
 function scaleClipboard(data) { return loadDataImage(data).then(image => { const max=Math.max(image.naturalWidth,image.naturalHeight); if(max<=PREVIEW_MAX_SIDE) return data; const s=PREVIEW_MAX_SIDE/max, canvas=document.createElement('canvas'); canvas.width=Math.round(image.naturalWidth*s); canvas.height=Math.round(image.naturalHeight*s); canvas.getContext('2d').drawImage(image,0,0,canvas.width,canvas.height); return canvas.toDataURL('image/png'); }); }
 let loadingPath='', loadingStarted=0;
+async function initializeRuntime() {
+  const select=$('runtime'), gpuName=$('gpu-name'); select.disabled=true; status('正在检测显卡…');
+  try {
+    const gpu=await invoke('gpu_info');
+    gpuName.textContent=gpu.name;
+    gpuName.title=gpu.name;
+    gpuName.classList.toggle('unavailable',!gpu.detected);
+    if(['30','40','50'].includes(gpu.runtime)) select.value=gpu.runtime;
+    select.title=gpu.detected?`已识别：${gpu.name}`:'未识别到支持的 RTX 显卡，当前使用默认 RTX 50';
+    if(gpu.detected){log(`已识别 ${gpu.name}，自动选择 RTX ${gpu.runtime}`);status(`已自动选择 RTX ${gpu.runtime}`);}
+    else {log(`显卡识别失败：${gpu.name}`);status('显卡未识别，默认使用 RTX 50');}
+  } catch(e) {
+    gpuName.textContent='未识别到显卡';
+    gpuName.title='显卡识别失败';
+    gpuName.classList.add('unavailable');
+    log(`显卡识别: ${e}`); select.title='显卡识别失败，当前使用默认 RTX 50'; status('显卡识别失败，默认使用 RTX 50');
+  } finally { select.disabled=false; }
+}
 async function loadPath(path) {
+  await runtimeReady;
   stopPlayback();
   status('正在读取素材…');
   const now=Date.now();
@@ -85,9 +105,21 @@ function droppedPaths(payload) { const value=payload?.paths??payload; return Arr
 let lastDropPath='', lastDropAt=0;
 async function loadDroppedPath(value) { const path=normalizeDroppedPath(value); if(!path){status('无法读取拖入素材');return;} const now=Date.now(); if(path===lastDropPath&&now-lastDropAt<500)return; lastDropPath=path;lastDropAt=now; try { status('正在读取拖入素材…'); await loadPath(path); } catch(e) { log(`拖放: ${e}`); status('拖放失败'); } }
 function setDropActive(active) { stage.classList.toggle('drop-active',active); }
-['dragenter','dragover'].forEach(type=>document.addEventListener(type,event=>{event.preventDefault();if(event.dataTransfer)event.dataTransfer.dropEffect='copy';setDropActive(true);}));
-document.addEventListener('dragleave',event=>{if(!event.relatedTarget)setDropActive(false);});
-document.addEventListener('drop',event=>{event.preventDefault();event.stopPropagation();setDropActive(false);const file=event.dataTransfer?.files?.[0];const uri=event.dataTransfer?.getData('text/uri-list')?.split(/\r?\n/).find(item=>item&&!item.startsWith('#'));const path=file?.path||uri;if(path)loadDroppedPath(path);});
+let dropPollBusy=false, dropPollFailureLogged=false;
+async function pollNativeDrop() {
+  if(dropPollBusy)return;
+  dropPollBusy=true;
+  try {
+    const result=await invoke('poll_drop');
+    setDropActive(Boolean(result.active));
+    const paths=droppedPaths(result.paths);
+    if(paths[0])await loadDroppedPath(paths[0]);
+  } catch(e) {
+    if(!dropPollFailureLogged){log(`拖放监听: ${e}`);dropPollFailureLogged=true;}
+  } finally { dropPollBusy=false; }
+}
+setInterval(pollNativeDrop,120);
+pollNativeDrop();
 let refreshTimer, playHandle=null, playStartedAt=0, playStartedFrame=0;
 let refreshQueued=false, refreshQueuedFit=false;
 function refresh(fit=false, delay=90) {
@@ -96,6 +128,7 @@ function refresh(fit=false, delay=90) {
   refreshQueued=true;
   refreshQueuedFit=refreshQueuedFit||fit;
   return new Promise(resolve => refreshTimer=setTimeout(async()=>{
+    await runtimeReady;
     refreshQueued=false;
     if(!state.path){refreshQueuedFit=false;resolve();return;}
     if(state.busy){refreshQueued=true;resolve();return;}
@@ -158,13 +191,4 @@ $('export-full').onclick=async()=>{if(!state.path)return;try{const destination=a
 $('copy').onclick=async()=>{if(!state.path)return;try{await navigator.clipboard.write([new ClipboardItem({'image/png':await(await fetch(await currentImageData())).blob()})]);status('当前画面已复制');}catch(e){log(`复制失败: ${e}`);}};
 document.addEventListener('paste',()=>$('paste').click());
 new ResizeObserver(()=>{if(state.path&&Math.abs(state.zoom-state.fit)<.01)resetFit();updateSplit();}).observe(stage);
-function handleNativeDrop(event){const type=event.payload?.type;if(type==='enter'||type==='over')setDropActive(true);else if(type==='leave')setDropActive(false);else if(type==='drop'){setDropActive(false);const paths=droppedPaths(event.payload);if(paths[0])loadDroppedPath(paths[0]);}}
-async function installNativeDrop(){
-  const currentWebview=window.__TAURI__?.webview?.getCurrentWebview?.();
-  const currentWindow=window.__TAURI__?.window?.getCurrentWindow?.();
-  for(const target of [currentWebview,currentWindow]){
-    if(!target?.onDragDropEvent)continue;
-    try{await target.onDragDropEvent(handleNativeDrop);return;}catch(error){log(`拖放监听: ${error}`);}
-  }
-}
-installNativeDrop();
+runtimeReady=initializeRuntime();

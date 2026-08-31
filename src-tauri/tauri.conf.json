@@ -6,7 +6,7 @@
   "build": { "frontendDist": "../ui" },
   "app": {
     "withGlobalTauri": true,
-    "windows": [{ "title": "DLSS5 Neural Render", "width": 1280, "height": 860, "minWidth": 980, "minHeight": 700, "resizable": true }],
+    "windows": [{ "title": "DLSS5 Neural Render", "width": 1280, "height": 860, "minWidth": 980, "minHeight": 700, "resizable": true, "dragDropEnabled": true }],
     "security": { "csp": null }
   },
   "bundle": {

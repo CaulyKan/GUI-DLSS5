@@ -17,7 +17,9 @@ cargo build --release --manifest-path src-tauri\Cargo.toml
 直接双击项目根目录中的 `run.bat` 即可启动；如果 release 程序尚未构建，脚本会
 自动执行上述 Cargo 构建。启动脚本只使用 ASCII 字符，兼容旧版 Windows
 PowerShell / CMD 的代码页，并会自动固定工作目录，确保程序能够找到宿主 DLL 和
-选中的 RTX 运行时。
+选中的 RTX 运行时。程序启动时会通过 NVIDIA 驱动自动识别 RTX 30 / 40 / 50 系列，
+并选择对应运行时；无法识别时默认使用 RTX 50，也可以手动切换。
+顶部会同时显示检测到的 NVIDIA 显卡名称。
 
 ## 内置运行时
 

@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex,
     },
 };
@@ -64,6 +64,21 @@ struct MediaInfo {
     height: u32,
     frames: u32,
     fps: f64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GpuInfo {
+    name: String,
+    runtime: String,
+    detected: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DropPoll {
+    active: bool,
+    paths: Vec<String>,
 }
 
 struct Host {
@@ -214,6 +229,9 @@ struct AppState {
     media: Mutex<HashMap<String, MediaInfo>>,
     decoder: Mutex<Option<VideoDecoder>>,
     temp_counter: AtomicU64,
+    gpu: GpuInfo,
+    drop_active: AtomicBool,
+    pending_drop_paths: Mutex<Vec<PathBuf>>,
 }
 
 struct VideoDecoder {
@@ -268,6 +286,47 @@ fn runtime_path(root: &Path, runtime: &str) -> Result<PathBuf, String> {
             format!("缺少 RTX {runtime} 运行时：{name}。请确认安装目录中的运行时文件完整。")
         })
 }
+
+fn gpu_runtime(name: &str) -> Option<&'static str> {
+    let name = name.to_ascii_uppercase();
+    ["50", "40", "30"].into_iter().find(|generation| {
+        name.contains(&format!("RTX {generation}")) || name.contains(&format!("RTX{generation}"))
+    })
+}
+
+fn detect_gpu_info() -> GpuInfo {
+    let output = Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader,nounits"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let names: Vec<String> = output
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let runtime = names
+        .iter()
+        .find_map(|name| gpu_runtime(name))
+        .unwrap_or("50")
+        .to_owned();
+    let detected = names.iter().any(|name| gpu_runtime(name).is_some());
+    GpuInfo {
+        name: names
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "未检测到 NVIDIA GPU".into()),
+        runtime,
+        detected,
+    }
+}
+
 fn root_dir(app: &tauri::AppHandle) -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_default();
     if cwd.join("dlssnr_host.dll").is_file() {
@@ -613,6 +672,27 @@ fn choose_export(video: bool) -> Option<String> {
 }
 
 #[tauri::command]
+fn gpu_info(state: tauri::State<'_, AppState>) -> GpuInfo {
+    state.gpu.clone()
+}
+
+#[tauri::command]
+fn poll_drop(state: tauri::State<'_, AppState>) -> Result<DropPoll, String> {
+    let mut pending = state
+        .pending_drop_paths
+        .lock()
+        .map_err(|_| "拖放路径缓存锁定失败")?;
+    let paths = pending
+        .drain(..)
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    Ok(DropPoll {
+        active: state.drop_active.load(Ordering::Acquire),
+        paths,
+    })
+}
+
+#[tauri::command]
 async fn media_info(state: tauri::State<'_, AppState>, path: String) -> Result<MediaInfo, String> {
     let source_path = path;
     let path_buf = PathBuf::from(&source_path);
@@ -899,6 +979,27 @@ fn main() {
         }
     }
     tauri::Builder::default()
+        .on_window_event(|window, event| {
+            let Some(state) = window.try_state::<AppState>() else {
+                return;
+            };
+            match event {
+                tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Enter { .. })
+                | tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Over { .. }) => {
+                    state.drop_active.store(true, Ordering::Release);
+                }
+                tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Leave) => {
+                    state.drop_active.store(false, Ordering::Release);
+                }
+                tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
+                    state.drop_active.store(false, Ordering::Release);
+                    if let Ok(mut pending) = state.pending_drop_paths.lock() {
+                        pending.extend(paths.iter().cloned());
+                    }
+                }
+                _ => {}
+            }
+        })
         .setup(|app| {
             let root = root_dir(&app.handle());
             let temp_dir = root.join("Temp");
@@ -913,12 +1014,17 @@ fn main() {
                 media: Mutex::new(HashMap::new()),
                 decoder: Mutex::new(None),
                 temp_counter: AtomicU64::new(0),
+                gpu: detect_gpu_info(),
+                drop_active: AtomicBool::new(false),
+                pending_drop_paths: Mutex::new(Vec::new()),
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             choose_media,
             choose_export,
+            gpu_info,
+            poll_drop,
             media_info,
             read_image_data,
             process_image,
