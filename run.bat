@@ -1,12 +1,31 @@
 @echo off
 setlocal
-set "APP=%~dp0src-tauri\target\release\dlss5-tauri.exe"
+pushd "%~dp0"
+set "APP=%CD%\src-tauri\target\release\dlss5-tauri.exe"
 if not exist "%APP%" (
-  echo Build missing: src-tauri\target\release\dlss5-tauri.exe
-  echo Run: cargo build --release --manifest-path src-tauri\Cargo.toml
+  where cargo >nul 2>&1
+  if errorlevel 1 (
+    echo Build missing and Cargo was not found in PATH.
+    echo Install Rust, then double-click run.bat again.
+    pause
+    popd
+    exit /b 1
+  )
+  echo Build missing. Building release executable...
+  cargo build --release --manifest-path src-tauri\Cargo.toml
+  if errorlevel 1 (
+    echo Build failed. See the output above for details.
+    pause
+    popd
+    exit /b 1
+  )
+)
+if not exist "%APP%" (
+  echo Build completed but the executable was not found:
+  echo %APP%
   pause
+  popd
   exit /b 1
 )
-pushd "%~dp0"
 start "" "%APP%"
 popd

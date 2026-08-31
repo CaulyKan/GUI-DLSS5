@@ -14,9 +14,10 @@ cargo build --release --manifest-path src-tauri\Cargo.toml
 
 构建后的程序位于 `src-tauri\target\release\dlss5-tauri.exe`。
 
-完成一次构建后，可以直接双击项目根目录中的 `run.bat` 启动。启动脚本只使用
-ASCII 字符，兼容旧版 Windows PowerShell / CMD 的代码页，并会自动固定工作目录，
-确保程序能够找到宿主 DLL 和选中的 RTX 运行时。
+直接双击项目根目录中的 `run.bat` 即可启动；如果 release 程序尚未构建，脚本会
+自动执行上述 Cargo 构建。启动脚本只使用 ASCII 字符，兼容旧版 Windows
+PowerShell / CMD 的代码页，并会自动固定工作目录，确保程序能够找到宿主 DLL 和
+选中的 RTX 运行时。
 
 ## 内置运行时
 
