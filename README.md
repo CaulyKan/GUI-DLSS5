@@ -2,6 +2,10 @@
 
 基于 Rust + Tauri v2 的 DLSS Neural Rendering 桌面预览与导出工具。
 
+## 界面预览
+
+![DLSS5 Neural Render 软件界面](Preview.jpg)
+
 ## 构建
 
 ```powershell
