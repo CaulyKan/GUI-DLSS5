@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use image::{imageops::FilterType, DynamicImage, ImageFormat, RgbaImage};
+use image::{codecs::png::PngEncoder, imageops::FilterType, ExtendedColorType, ImageEncoder, RgbaImage};
 use libloading::Library;
 use serde::{Deserialize, Serialize};
 use std::os::windows::ffi::OsStrExt;
@@ -9,7 +9,7 @@ use std::os::windows::process::CommandExt;
 use std::{
     collections::{HashMap, VecDeque},
     ffi::OsStr,
-    io::{Cursor, Read, Write},
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
     sync::{
@@ -17,7 +17,7 @@ use std::{
         Mutex,
     },
 };
-use tauri::Manager;
+use tauri::{ipc::Response, Manager};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const PREVIEW_CACHE_FRAMES: usize = 12;
@@ -109,6 +109,10 @@ struct Host {
     runtime: String,
     width: i32,
     height: i32,
+    // 运动矢量与深度恒为零输入（无引擎数据），随会话按尺寸复用，避免逐帧分配 25MB
+    motion: Vec<f32>,
+    depth: Vec<f32>,
+    output: Vec<u8>,
     ready: bool,
 }
 
@@ -145,6 +149,9 @@ impl Host {
             runtime: runtime.into(),
             width: 0,
             height: 0,
+            motion: Vec::new(),
+            depth: Vec::new(),
+            output: Vec::new(),
             ready: false,
         })
     }
@@ -200,6 +207,12 @@ impl Host {
             self.width = width;
             self.height = height;
         }
+        let pixels = (width.max(0) as usize) * (height.max(0) as usize);
+        if self.motion.len() != pixels * 2 {
+            self.motion = vec![0_f32; pixels * 2];
+            self.depth = vec![0_f32; pixels];
+            self.output = vec![0_u8; pixels * 4];
+        }
         Ok(())
     }
 
@@ -207,27 +220,27 @@ impl Host {
         &mut self,
         root: &Path,
         runtime: &str,
-        mut input: Vec<u8>,
+        input: &[u8],
         width: u32,
         height: u32,
         settings: &RenderSettings,
         reset: bool,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<&[u8], String> {
         self.ensure(root, runtime, width as i32, height as i32, settings)?;
-        let mut motion = vec![0_f32; (width * height * 2) as usize];
-        let mut depth = vec![0_f32; (width * height) as usize];
-        let mut output = vec![0_u8; input.len()];
+        if input.len() != self.output.len() {
+            return Err("帧数据长度与 DLSS 会话不符。".into());
+        }
         if (self.process)(
-            input.as_mut_ptr(),
-            motion.as_mut_ptr(),
-            depth.as_mut_ptr(),
-            output.as_mut_ptr(),
+            input.as_ptr() as *mut u8,
+            self.motion.as_mut_ptr(),
+            self.depth.as_mut_ptr(),
+            self.output.as_mut_ptr(),
             i32::from(reset),
         ) == 0
         {
             return Err("DLSS 未生成画面。".into());
         }
-        Ok(output)
+        Ok(self.output.as_slice())
     }
 }
 
@@ -639,16 +652,12 @@ fn bake_gif(state: &AppState, source: &str) -> Result<String, String> {
     Ok(destination.to_string_lossy().into_owned())
 }
 
-fn rgba_png(bytes: Vec<u8>, width: u32, height: u32) -> Result<String, String> {
-    let image = RgbaImage::from_raw(width, height, bytes).ok_or("无效的 RGBA 图像")?;
-    let mut out = Cursor::new(Vec::new());
-    DynamicImage::ImageRgba8(image)
-        .write_to(&mut out, ImageFormat::Png)
+fn rgba_png(bytes: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    PngEncoder::new(&mut out)
+        .write_image(bytes, width, height, ExtendedColorType::Rgba8)
         .map_err(|e| e.to_string())?;
-    Ok(format!(
-        "data:image/png;base64,{}",
-        STANDARD.encode(out.into_inner())
-    ))
+    Ok(out)
 }
 fn image_data_uri(data: &str) -> Result<RgbaImage, String> {
     let encoded = data.split_once(',').ok_or("无效图片数据")?.1;
@@ -677,24 +686,17 @@ fn process_rgba(
     image: RgbaImage,
     runtime: String,
     settings: RenderSettings,
-) -> Result<String, String> {
+) -> Result<Vec<u8>, String> {
     let (w, h) = image.dimensions();
     let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
     if host.is_none() {
         *host = Some(unsafe { Host::load(&state.root, &runtime)? });
     }
-    let output = unsafe {
-        host.as_mut().unwrap().render(
-            &state.root,
-            &runtime,
-            image.into_raw(),
-            w,
-            h,
-            &settings,
-            true,
-        )?
+    let input = image.into_raw();
+    let rendered = unsafe {
+        host.as_mut().unwrap().render(&state.root, &runtime, &input, w, h, &settings, true)?
     };
-    rgba_png(output, w, h)
+    rgba_png(rendered, w, h)
 }
 
 #[tauri::command]
@@ -814,12 +816,17 @@ async fn process_image(
     runtime: String,
     settings: RenderSettings,
     max_side: u32,
-) -> Result<String, String> {
+) -> Result<Response, String> {
     let image = image::open(&path)
         .map_err(|e| format!("无法读取图片: {e}"))?
         .to_rgba8();
     let _ = app;
-    process_rgba(&state, preview_size(image, max_side), runtime, settings)
+    Ok(Response::new(process_rgba(
+        &state,
+        preview_size(image, max_side),
+        runtime,
+        settings,
+    )?))
 }
 
 #[tauri::command]
@@ -829,13 +836,13 @@ async fn process_image_data(
     runtime: String,
     settings: RenderSettings,
     max_side: u32,
-) -> Result<String, String> {
-    process_rgba(
+) -> Result<Response, String> {
+    Ok(Response::new(process_rgba(
         &state,
         preview_size(image_data_uri(&data)?, max_side),
         runtime,
         settings,
-    )
+    )?))
 }
 
 #[tauri::command]
@@ -852,13 +859,13 @@ async fn save_data_png(
 }
 
 #[tauri::command]
-async fn read_image_data(path: String, max_side: u32) -> Result<String, String> {
+async fn read_image_data(path: String, max_side: u32) -> Result<Response, String> {
     let image = image::open(path)
         .map_err(|e| format!("无法读取图片: {e}"))?
         .to_rgba8();
     let image = preview_size(image, max_side);
     let (w, h) = image.dimensions();
-    rgba_png(image.into_raw(), w, h)
+    Ok(Response::new(rgba_png(&image.into_raw(), w, h)?))
 }
 
 #[tauri::command]
@@ -879,18 +886,11 @@ async fn save_png(
         if host.is_none() {
             *host = Some(unsafe { Host::load(&state.root, &runtime)? });
         }
+        let input = image.into_raw();
         let out = unsafe {
-            host.as_mut().unwrap().render(
-                &state.root,
-                &runtime,
-                image.into_raw(),
-                w,
-                h,
-                &settings,
-                true,
-            )?
+            host.as_mut().unwrap().render(&state.root, &runtime, &input, w, h, &settings, true)?
         };
-        RgbaImage::from_raw(w, h, out)
+        RgbaImage::from_raw(w, h, out.to_vec())
             .ok_or("无效输出")?
             .save(&destination)
             .map_err(|e| format!("无法写入 PNG: {e}"))?;
@@ -900,45 +900,75 @@ async fn save_png(
     result
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct VideoFramePreview {
-    original: String,
-    processed: String,
+#[tauri::command]
+async fn frame_png(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    frame: u32,
+    max_side: u32,
+) -> Result<Response, String> {
+    let (bytes, w, h) = decode_video_frame(&state, &path, frame, max_side)?;
+    Ok(Response::new(rgba_png(&bytes, w, h)?))
 }
 
 #[tauri::command]
-async fn preview_video_frame(
+async fn render_frame_png(
     state: tauri::State<'_, AppState>,
     path: String,
     frame: u32,
     runtime: String,
     settings: RenderSettings,
     max_side: u32,
-) -> Result<VideoFramePreview, String> {
+) -> Result<Response, String> {
     let (bytes, w, h) = decode_video_frame(&state, &path, frame, max_side)?;
-    let image = RgbaImage::from_raw(w, h, bytes).ok_or("无效视频帧")?;
-    let original = rgba_png(image.clone().into_raw(), w, h)?;
-    let (w, h) = image.dimensions();
     let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
     if host.is_none() {
         *host = Some(unsafe { Host::load(&state.root, &runtime)? });
     }
     let rendered = unsafe {
-        host.as_mut().unwrap().render(
-            &state.root,
-            &runtime,
-            image.into_raw(),
-            w,
-            h,
-            &settings,
-            true,
-        )?
+        host.as_mut()
+            .unwrap()
+            .render(&state.root, &runtime, &bytes, w, h, &settings, true)?
     };
-    Ok(VideoFramePreview {
-        original,
-        processed: rgba_png(rendered, w, h)?,
-    })
+    Ok(Response::new(rgba_png(rendered, w, h)?))
+}
+
+// 预检 NVENC 会话是否可用（驱动/并发限制），失败则回退 CPU 编码
+fn nvenc_available() -> bool {
+    let Ok(mut command) = tool("ffmpeg") else {
+        return false;
+    };
+    command
+        .args([
+            "-hide_banner",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=320x180:d=0.2",
+            "-frames:v",
+            "5",
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p5",
+            "-rc",
+            "vbr",
+            "-cq",
+            "23",
+            "-b:v",
+            "0",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
 }
 
 #[tauri::command]
@@ -951,8 +981,21 @@ async fn export_video(
 ) -> Result<u32, String> {
     let (w, h, total_frames, fps) = video_probe(&path)?;
     begin_export_progress(&state, total_frames)?;
+    let nvenc = nvenc_available();
+    set_export_progress(
+        &state,
+        true,
+        0,
+        total_frames,
+        if nvenc {
+            "已启用 NVENC，正在导出…".into()
+        } else {
+            "NVENC 不可用，使用 CPU 编码…".into()
+        },
+    );
     let mut current = 0;
     let result: Result<u32, String> = (|| {
+        let frame_bytes = (w * h * 4) as usize;
         let mut decode = tool("ffmpeg")?
             .args([
                 "-v", "error", "-i", &path, "-f", "rawvideo", "-pix_fmt", "rgba", "-",
@@ -960,6 +1003,8 @@ async fn export_video(
             .stdout(Stdio::piped())
             .spawn()
             .map_err(|e| format!("无法启动 FFmpeg 解码器: {e}"))?;
+        // 音轨在编码器内直接混流：应用中途退出时，残留的编码进程也会把
+        // 带音轨的文件收尾写盘，不会留下无声的半成品。
         let mut encode = tool("ffmpeg")?
             .args([
                 "-y",
@@ -975,73 +1020,132 @@ async fn export_video(
                 &fps.to_string(),
                 "-i",
                 "-",
-                "-an",
-                "-c:v",
-                "libx264",
+                "-i",
+                &path,
+                "-map",
+                "0:v",
+                "-map",
+                "1:a?",
+                "-c:a",
+                "copy",
                 "-pix_fmt",
                 "yuv420p",
-                &destination,
+                "-shortest",
             ])
+            .args(if nvenc {
+                &[
+                    "-c:v",
+                    "h264_nvenc",
+                    "-preset",
+                    "p5",
+                    "-rc",
+                    "vbr",
+                    "-cq",
+                    "23",
+                    "-b:v",
+                    "0",
+                ][..]
+            } else {
+                &["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"][..]
+            })
+            .arg(&destination)
             .stdin(Stdio::piped())
+            .stdout(Stdio::null())
             .spawn()
             .map_err(|e| format!("无法启动 FFmpeg 编码器: {e}"))?;
         let mut reader = decode.stdout.take().ok_or("无法读取视频数据")?;
         let mut writer = encode.stdin.take().ok_or("无法写入视频数据")?;
-        let mut buffer = vec![0_u8; (w * h * 4) as usize];
+        // 预读线程：GPU 推理当前帧的同时预取下一帧，解除读帧与渲染的串行
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(3);
+        let reader_thread = std::thread::spawn(move || {
+            let mut buffer = vec![0_u8; frame_bytes];
+            loop {
+                let mut read = 0;
+                while read < buffer.len() {
+                    match reader.read(&mut buffer[read..]) {
+                        Ok(0) => break,
+                        Ok(n) => read += n,
+                        Err(e) => {
+                            let _ = tx.send(Err(e.to_string()));
+                            return;
+                        }
+                    }
+                }
+                if read == 0 {
+                    return;
+                }
+                if read != buffer.len() {
+                    let _ = tx.send(Err("视频流末尾帧不完整。".into()));
+                    return;
+                }
+                if tx.send(Ok(buffer.clone())).is_err() {
+                    return;
+                }
+            }
+        });
         let mut count = 0;
-        let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
-        if host.is_none() {
-            *host = Some(unsafe { Host::load(&state.root, &runtime)? });
-        }
-        loop {
-            let mut read = 0;
-            while read < buffer.len() {
-                let n = reader
-                    .read(&mut buffer[read..])
-                    .map_err(|e| e.to_string())?;
-                if n == 0 {
+        let mut outcome: Result<u32, String> = Ok(0);
+        {
+            let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
+            if host.is_none() {
+                *host = Some(unsafe { Host::load(&state.root, &runtime)? });
+            }
+            for message in rx {
+                let frame = match message {
+                    Ok(frame) => frame,
+                    Err(e) => {
+                        outcome = Err(e);
+                        break;
+                    }
+                };
+                let rendered = match unsafe {
+                    host.as_mut().unwrap().render(
+                        &state.root,
+                        &runtime,
+                        &frame,
+                        w,
+                        h,
+                        &settings,
+                        count == 0,
+                    )
+                } {
+                    Ok(rendered) => rendered,
+                    Err(e) => {
+                        outcome = Err(e);
+                        break;
+                    }
+                };
+                if let Err(e) = writer.write_all(rendered) {
+                    outcome = Err(format!("视频编码写入失败: {e}"));
                     break;
                 }
-                read += n;
+                count += 1;
+                current = count;
+                set_export_progress(
+                    &state,
+                    true,
+                    current,
+                    total_frames,
+                    format!("正在导出第 {current} / {total_frames} 帧"),
+                );
             }
-            if read == 0 {
-                break;
-            }
-            if read != buffer.len() {
-                return Err("视频流末尾帧不完整。".into());
-            }
-            let rendered = unsafe {
-                host.as_mut().unwrap().render(
-                    &state.root,
-                    &runtime,
-                    buffer.clone(),
-                    w,
-                    h,
-                    &settings,
-                    count == 0,
-                )?
-            };
-            writer
-                .write_all(&rendered)
-                .map_err(|e| format!("视频编码写入失败: {e}"))?;
-            count += 1;
-            current = count;
-            set_export_progress(
-                &state,
-                true,
-                current,
-                total_frames,
-                format!("正在导出第 {current} / {total_frames} 帧"),
-            );
         }
+        let _ = reader_thread.join();
         drop(writer);
-        if !decode.wait().map_err(|e| e.to_string())?.success() {
-            return Err("FFmpeg 解码失败。".into());
+        if outcome.is_err() {
+            let _ = decode.kill();
+            let _ = encode.kill();
         }
-        if !encode.wait().map_err(|e| e.to_string())?.success() {
-            return Err("FFmpeg 编码失败。".into());
+        if !decode.wait().map_err(|e| e.to_string())?.success() && outcome.is_ok() {
+            outcome = Err("FFmpeg 解码失败。".into());
         }
-        Ok(count)
+        if !encode.wait().map_err(|e| e.to_string())?.success() && outcome.is_ok() {
+            outcome = Err("FFmpeg 编码失败。".into());
+        }
+        if outcome.is_ok() {
+            outcome = Ok(count);
+        }
+        outcome
     })();
     finish_export_progress(&state, &result, current);
     result
@@ -1058,7 +1162,7 @@ fn main() {
         let settings = RenderSettings::default();
         let mut host = unsafe { Host::load(&root, runtime) }.expect("无法加载 DLSS 宿主");
         let input = vec![128_u8; 640 * 360 * 4];
-        match unsafe { host.render(&root, runtime, input, 640, 360, &settings, true) } {
+        match unsafe { host.render(&root, runtime, &input, 640, 360, &settings, true) } {
             Ok(output) if output.len() == 640 * 360 * 4 => {
                 println!("DLSS_SELFTEST_OK RTX{runtime}");
                 return;
@@ -1127,7 +1231,8 @@ fn main() {
             process_image_data,
             save_png,
             save_data_png,
-            preview_video_frame,
+            frame_png,
+            render_frame_png,
             export_video
         ])
         .run(tauri::generate_context!())
