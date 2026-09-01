@@ -1003,8 +1003,7 @@ async fn export_video(
             .stdout(Stdio::piped())
             .spawn()
             .map_err(|e| format!("无法启动 FFmpeg 解码器: {e}"))?;
-        // 音轨在编码器内直接混流：应用中途退出时，残留的编码进程也会把
-        // 带音轨的文件收尾写盘，不会留下无声的半成品。
+        // 音轨在编码器内统一转为 AAC 后写入 MP4，避免源音频编码与 MP4 容器不兼容。
         let mut encode = tool("ffmpeg")?
             .args([
                 "-y",
@@ -1027,7 +1026,9 @@ async fn export_video(
                 "-map",
                 "1:a?",
                 "-c:a",
-                "copy",
+                "aac",
+                "-b:a",
+                "192k",
                 "-pix_fmt",
                 "yuv420p",
                 "-shortest",
