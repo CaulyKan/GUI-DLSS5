@@ -5,11 +5,12 @@ let runtimeReady = Promise.resolve();
 const state = { path:null, sourcePath:null, kind:null, info:null, original:null, processed:null, zoom:1, fit:1, panX:0, panY:0, splitX:null, dragging:null, request:0, busy:false };
 const stage = $('stage'), preview = $('preview'), originalPreview = $('original-preview'), originalMask = $('original-mask'), abView = $('ab-view');
 const abPanes = Array.from(abView.querySelectorAll('.ab-pane')), abOriginal = $('ab-original'), abProcessed = $('ab-processed');
-const settings = () => ({ style:+$('style').value, intensity:+$('intensity').value, localTone:+$('tone').value, localStruct:+$('struct').value, outputView:0, outputMix:1 });
+const settings = () => ({ style:+$('style').value, intensity:+$('intensity').value, localTone:+$('tone').value, localStruct:+$('struct').value, skinStructure:+$('skin').value, useAutoMask:$('auto-mask').checked, uiCorrection:$('ui-correction').checked, outputView:0, outputMix:1 });
 function log(message) { console.debug(`[DLSS5] ${message}`); }
 function status(message) { $('status').textContent = message; }
 function syncControls(range, number) { $(range).oninput = () => { $(number).value = $(range).value; refresh(); }; $(number).onchange = () => { $(range).value = Math.max(0, Math.min(1, +$(number).value || 0)); refresh(); }; }
-syncControls('intensity','intensity-num'); syncControls('tone','tone-num'); syncControls('struct','struct-num');
+syncControls('intensity','intensity-num'); syncControls('tone','tone-num'); syncControls('struct','struct-num'); syncControls('skin','skin-num');
+$('auto-mask').onchange=()=>refresh(); $('ui-correction').onchange=()=>refresh();
 function syncAbLayout() {
   const original = abOriginal, processed = abProcessed;
   const w = original.naturalWidth || processed.naturalWidth || 1;

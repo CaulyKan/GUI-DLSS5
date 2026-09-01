@@ -33,11 +33,15 @@ type ShutdownFn = unsafe extern "C" fn();
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(default)]
 struct RenderSettings {
     style: i32,
     intensity: f32,
     local_tone: f32,
     local_struct: f32,
+    skin_structure: f32,
+    use_auto_mask: bool,
+    ui_correction: bool,
     output_view: i32,
     output_mix: f32,
 }
@@ -49,6 +53,9 @@ impl Default for RenderSettings {
             intensity: 1.0,
             local_tone: 1.0,
             local_struct: 1.0,
+            skin_structure: 1.0,
+            use_auto_mask: false,
+            ui_correction: false,
             output_view: 0,
             output_mix: 1.0,
         }
@@ -149,9 +156,9 @@ impl Host {
             settings.intensity,
             settings.local_tone,
             settings.local_struct,
-            1.0,
-            0,
-            0,
+            settings.skin_structure,
+            i32::from(settings.use_auto_mask),
+            i32::from(settings.ui_correction),
             0,
             2,
             1.0,
