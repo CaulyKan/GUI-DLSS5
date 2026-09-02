@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use image::{codecs::png::PngEncoder, imageops::FilterType, ExtendedColorType, ImageEncoder, RgbaImage};
+use image::{
+    codecs::png::PngEncoder, imageops::FilterType, ExtendedColorType, ImageEncoder, RgbaImage,
+};
 use libloading::Library;
 use serde::{Deserialize, Serialize};
 use std::os::windows::ffi::OsStrExt;
@@ -289,7 +291,8 @@ impl VsrHost {
         let dir = wide(root);
         if init(dir.as_ptr()) == 0 {
             return Err(
-                "RTX VSR 不可用：需要 RTX 20 系及以上显卡与 550+ 驱动，且 nvngx_vsr.dll 完整。".into(),
+                "RTX VSR 不可用：需要 RTX 20 系及以上显卡与 550+ 驱动，且 nvngx_vsr.dll 完整。"
+                    .into(),
             );
         }
         Ok(Self {
@@ -299,7 +302,13 @@ impl VsrHost {
         })
     }
 
-    unsafe fn upscale(&self, image: &RgbaImage, tw: u32, th: u32, quality: i32) -> Option<RgbaImage> {
+    unsafe fn upscale(
+        &self,
+        image: &RgbaImage,
+        tw: u32,
+        th: u32,
+        quality: i32,
+    ) -> Option<RgbaImage> {
         let (w, h) = image.dimensions();
         let input = image.as_raw();
         let mut out = vec![0_u8; (tw as usize) * (th as usize) * 4];
@@ -635,7 +644,12 @@ fn preview_original(image: RgbaImage, max_side: u32, target: Option<(u32, u32)>)
 }
 
 // 预览放大允许容错：VSR 单帧失败时回退最近邻，并销毁当前 VSR 会话以便下次重建。
-fn upscale_frame(state: &AppState, image: RgbaImage, target: (u32, u32), quality: i32) -> RgbaImage {
+fn upscale_frame(
+    state: &AppState,
+    image: RgbaImage,
+    target: (u32, u32),
+    quality: i32,
+) -> RgbaImage {
     let (tw, th) = target;
     let (w, h) = image.dimensions();
     if (tw, th) == (w, h) {
@@ -721,7 +735,12 @@ fn resize_to_target_strict(
                     Err("请求的输出尺寸大于源分辨率，但 RTX VSR 未启用。".into())
                 }
             } else {
-                Ok(image::imageops::resize(&image, tw, th, FilterType::Lanczos3))
+                Ok(image::imageops::resize(
+                    &image,
+                    tw,
+                    th,
+                    FilterType::Lanczos3,
+                ))
             }
         }
         _ => Ok(image),
@@ -841,7 +860,13 @@ fn decode_video_frame(
         } else {
             0
         };
-        *slot = Some(spawn_decoder(&info, target_w, target_h, max_side, start_frame)?);
+        *slot = Some(spawn_decoder(
+            &info,
+            target_w,
+            target_h,
+            max_side,
+            start_frame,
+        )?);
     }
     let decoder = slot.as_mut().unwrap();
     let frame_bytes = (decoder.width * decoder.height * 4) as usize;
@@ -943,7 +968,9 @@ fn process_rgba(
     }
     let input = image.into_raw();
     let rendered = unsafe {
-        host.as_mut().unwrap().render(&state.root, &runtime, &input, w, h, &settings, true)?
+        host.as_mut()
+            .unwrap()
+            .render(&state.root, &runtime, &input, w, h, &settings, true)?
     };
     rgba_png(rendered, w, h)
 }
@@ -1158,7 +1185,11 @@ async fn read_image_data(
     let image = image::open(path)
         .map_err(|e| format!("无法读取图片: {e}"))?
         .to_rgba8();
-    let image = preview_original(image, max_side, sanitize_output(output_width, output_height));
+    let image = preview_original(
+        image,
+        max_side,
+        sanitize_output(output_width, output_height),
+    );
     let (w, h) = image.dimensions();
     Ok(Response::new(rgba_png(&image.into_raw(), w, h)?))
 }
@@ -1192,7 +1223,9 @@ async fn save_png(
         }
         let input = image.into_raw();
         let out = unsafe {
-            host.as_mut().unwrap().render(&state.root, &runtime, &input, w, h, &settings, true)?
+            host.as_mut()
+                .unwrap()
+                .render(&state.root, &runtime, &input, w, h, &settings, true)?
         };
         RgbaImage::from_raw(w, h, out.to_vec())
             .ok_or("无效输出")?
@@ -1217,7 +1250,8 @@ fn decoded_preview_frame(
     nearest: bool,
     quality: i32,
 ) -> Result<RgbaImage, String> {
-    let (bytes, dw, dh) = decode_video_frame(&state, path, frame, max_side, target, vsr || nearest)?;
+    let (bytes, dw, dh) =
+        decode_video_frame(&state, path, frame, max_side, target, vsr || nearest)?;
     let image = RgbaImage::from_raw(dw, dh, bytes).ok_or("无效视频帧")?;
     let (pw, ph) = target
         .map(|(w, h)| preview_dimensions(w, h, max_side))
@@ -1232,7 +1266,12 @@ fn decoded_preview_frame(
             Ok(upscale_frame(state, image, (pw, ph), quality))
         }
     } else {
-        Ok(image::imageops::resize(&image, pw, ph, FilterType::CatmullRom))
+        Ok(image::imageops::resize(
+            &image,
+            pw,
+            ph,
+            FilterType::CatmullRom,
+        ))
     }
 }
 
@@ -1286,9 +1325,15 @@ async fn render_frame_png(
         *host = Some(unsafe { Host::load(&state.root, &runtime)? });
     }
     let rendered = unsafe {
-        host.as_mut()
-            .unwrap()
-            .render(&state.root, &runtime, &image.into_raw(), w, h, &settings, true)?
+        host.as_mut().unwrap().render(
+            &state.root,
+            &runtime,
+            &image.into_raw(),
+            w,
+            h,
+            &settings,
+            true,
+        )?
     };
     Ok(Response::new(rgba_png(rendered, w, h)?))
 }
@@ -1377,7 +1422,8 @@ async fn export_video(
 ) -> Result<u32, String> {
     let (source_w, source_h, total_frames, fps) = video_probe(&path)?;
     let vsr_mode = settings.upscale == "vsr";
-    let (mut w, mut h) = sanitize_output(output_width, output_height).unwrap_or((source_w, source_h));
+    let (mut w, mut h) =
+        sanitize_output(output_width, output_height).unwrap_or((source_w, source_h));
     if !(vsr_mode && w > source_w && h > source_h) {
         // 放大功能整体依赖 RTX VSR：未启用时导出不超过源分辨率
         w = w.min(source_w);
@@ -1385,11 +1431,7 @@ async fn export_video(
     }
     // VSR 模式且在放大时：解码保持源分辨率，放大交给 GPU，其余交给 FFmpeg scale
     let bypass = vsr_mode && w > source_w && h > source_h;
-    let (decode_w, decode_h) = if bypass {
-        (source_w, source_h)
-    } else {
-        (w, h)
-    };
+    let (decode_w, decode_h) = if bypass { (source_w, source_h) } else { (w, h) };
     let quality = settings.encoder_quality.clamp(0, 51);
     let quality_s = quality.to_string();
     let (encoder, hw) = resolve_encoder(&settings.encoder);
@@ -1400,7 +1442,9 @@ async fn export_video(
         ));
     }
     if hw && encoder == "hevc_nvenc" && (w > 8192 || h > 8192) {
-        return Err(format!("H.265 (NVENC) 最高支持 8192×8192，当前输出 {w}×{h}。"));
+        return Err(format!(
+            "H.265 (NVENC) 最高支持 8192×8192，当前输出 {w}×{h}。"
+        ));
     }
     let label = match encoder {
         "h264_nvenc" => "H.264 NVENC".to_string(),
@@ -1453,15 +1497,7 @@ async fn export_video(
                 "0:v",
             ])
             .args(if settings.keep_audio {
-                vec![
-                    "-map",
-                    "1:a?",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "192k",
-                    "-shortest",
-                ]
+                vec!["-map", "1:a?", "-c:a", "aac", "-b:a", "192k", "-shortest"]
             } else {
                 Vec::new()
             })
@@ -1480,7 +1516,14 @@ async fn export_video(
                     "0",
                 ]
             } else {
-                vec!["-c:v", encoder, "-preset", "veryfast", "-crf", quality_s.as_str()]
+                vec![
+                    "-c:v",
+                    encoder,
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    quality_s.as_str(),
+                ]
             })
             .arg(&destination)
             .stdin(Stdio::piped())
@@ -1552,18 +1595,16 @@ async fn export_video(
                 };
                 let data: Vec<u8> = if bypass {
                     match RgbaImage::from_raw(decode_w, decode_h, frame) {
-                        Some(image) => match upscale_frame_strict(
-                            &state,
-                            image,
-                            (w, h),
-                            settings.vsr_quality,
-                        ) {
-                            Ok(upscaled) => upscaled.into_raw(),
-                            Err(error) => {
-                                outcome = Err(error);
-                                break;
+                        Some(image) => {
+                            match upscale_frame_strict(&state, image, (w, h), settings.vsr_quality)
+                            {
+                                Ok(upscaled) => upscaled.into_raw(),
+                                Err(error) => {
+                                    outcome = Err(error);
+                                    break;
+                                }
                             }
-                        },
+                        }
                         None => {
                             outcome = Err("无效视频帧".into());
                             break;
