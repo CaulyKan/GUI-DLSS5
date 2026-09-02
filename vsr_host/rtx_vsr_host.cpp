@@ -9,8 +9,7 @@
 // vsr_init creates the D3D12 device, initializes NGX (searching snippet_dir for
 // nvngx_vsr.dll) and creates the VSR feature; it returns 0 when VSR is unavailable
 // (no NVIDIA RTX GPU, driver too old, missing snippet DLL). vsr_upscale runs a
-// synchronous RGBA8 -> RGBA8 upscale and returns 1 on success, 0 on any failure
-// (the caller falls back to CPU resampling).
+// synchronous RGBA8 -> RGBA8 upscale and returns 1 on success, 0 on any failure.
 //
 // Built both as DLL and, with VSR_HOST_TEST defined, as a self-test executable.
 #include <windows.h>
@@ -41,6 +40,7 @@ static UINT64 g_fenceValue = 1;
 static NVSDK_NGX_Parameter* g_params = nullptr;
 static NVSDK_NGX_Handle* g_feature = nullptr;
 static bool g_ready = false;
+static bool g_ngxInitialized = false;
 static std::wstring g_dir;
 static ID3D12CommandList* g_lists[1] = {};
 
@@ -71,13 +71,21 @@ static void vlog(const char* fmt, ...) {
     fclose(f);
 }
 
-static void flushGpu() {
-    g_fenceValue++;
-    g_queue->Signal(g_fence, g_fenceValue);
+template <typename T>
+static void releaseCom(T*& object) {
+    if (object) object->Release();
+    object = nullptr;
+}
+
+static bool flushGpu() {
+    if (!g_queue || !g_fence || !g_fenceEvent) return false;
+    ++g_fenceValue;
+    if (FAILED(g_queue->Signal(g_fence, g_fenceValue))) return false;
     if (g_fence->GetCompletedValue() < g_fenceValue) {
-        g_fence->SetEventOnCompletion(g_fenceValue, g_fenceEvent);
-        WaitForSingleObject(g_fenceEvent, INFINITE);
+        if (FAILED(g_fence->SetEventOnCompletion(g_fenceValue, g_fenceEvent))) return false;
+        if (WaitForSingleObject(g_fenceEvent, INFINITE) != WAIT_OBJECT_0) return false;
     }
+    return true;
 }
 
 static ID3D12Resource* makeTexture(UINT w, UINT h, D3D12_RESOURCE_FLAGS flags) {
@@ -135,6 +143,46 @@ static void releaseSurfaces() {
     g_sf = Surfaces{};
 }
 
+static void cleanupHost(bool writeLog) {
+    releaseSurfaces();
+
+    if (g_ngxInitialized && g_device) {
+        NVSDK_NGX_D3D12_Shutdown1(g_device);
+    }
+    g_feature = nullptr;
+    g_params = nullptr;
+    g_ngxInitialized = false;
+
+    releaseCom(g_cmd);
+    releaseCom(g_alloc);
+    releaseCom(g_queue);
+    releaseCom(g_fence);
+    releaseCom(g_device);
+    g_lists[0] = nullptr;
+
+    if (g_fenceEvent) {
+        CloseHandle(g_fenceEvent);
+        g_fenceEvent = nullptr;
+    }
+
+    g_fenceValue = 1;
+    g_ready = false;
+    if (writeLog) vlog("VSR host shutdown");
+}
+
+static bool beginCommands() {
+    if (!g_alloc || !g_cmd) return false;
+    if (FAILED(g_alloc->Reset())) {
+        vlog("command allocator reset failed");
+        return false;
+    }
+    if (FAILED(g_cmd->Reset(g_alloc, nullptr))) {
+        vlog("command list reset failed");
+        return false;
+    }
+    return true;
+}
+
 // (Re)creates the upload/input/output/readback set when the requested size changes.
 static bool ensureSurfaces(UINT sw, UINT sh, UINT dw, UINT dh) {
     if (g_sf.sw == sw && g_sf.sh == sh && g_sf.dw == dw && g_sf.dh == dh) return true;
@@ -184,11 +232,18 @@ static bool ensureSurfaces(UINT sw, UINT sh, UINT dw, UINT dh) {
 extern "C" __declspec(dllexport) int vsr_init(const wchar_t* snippet_dir) {
     if (g_ready) return 1;
     if (!snippet_dir) return 0;
+
+    if (g_device || g_queue || g_alloc || g_cmd || g_fence || g_fenceEvent || g_ngxInitialized) {
+        cleanupHost(false);
+    }
     g_dir = snippet_dir;
 
     IDXGIFactory1* factory = nullptr;
     IDXGIAdapter1* adapter = nullptr;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) { vlog("CreateDXGIFactory1 failed"); return 0; }
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        vlog("CreateDXGIFactory1 failed");
+        return 0;
+    }
     for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
         DXGI_ADAPTER_DESC1 desc;
         adapter->GetDesc1(&desc);
@@ -197,7 +252,10 @@ extern "C" __declspec(dllexport) int vsr_init(const wchar_t* snippet_dir) {
         adapter = nullptr;
     }
     factory->Release();
-    if (!adapter) { vlog("no NVIDIA adapter"); return 0; }
+    if (!adapter) {
+        vlog("no NVIDIA adapter");
+        return 0;
+    }
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_device)))) {
         vlog("D3D12CreateDevice failed");
         adapter->Release();
@@ -212,33 +270,72 @@ extern "C" __declspec(dllexport) int vsr_init(const wchar_t* snippet_dir) {
         FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_alloc, nullptr,
                                            IID_PPV_ARGS(&g_cmd)))) {
         vlog("D3D12 setup failed");
+        cleanupHost(false);
         return 0;
     }
-    g_cmd->Close();
+    if (FAILED(g_cmd->Close())) {
+        vlog("initial command list close failed");
+        cleanupHost(false);
+        return 0;
+    }
     g_lists[0] = g_cmd;
     g_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_fenceEvent) {
+        vlog("CreateEventW failed");
+        cleanupHost(false);
+        return 0;
+    }
 
-    // NGX init with a path list pointing at the directory that carries nvngx_vsr.dll
+    // NGX init with a path list pointing at the directory that carries nvngx_vsr.dll.
     const wchar_t* paths[1] = { g_dir.c_str() };
     NVSDK_NGX_FeatureCommonInfo info = {};
     info.PathListInfo.Path = paths;
     info.PathListInfo.Length = 1;
     const NVSDK_NGX_Result initResult = NVSDK_NGX_D3D12_Init(0ull, L".", g_device, &info);
-    if (NVSDK_NGX_FAILED(initResult)) { vlog("NGX init failed 0x%08X", (unsigned)initResult); return 0; }
+    if (NVSDK_NGX_FAILED(initResult)) {
+        vlog("NGX init failed 0x%08X", (unsigned)initResult);
+        cleanupHost(false);
+        return 0;
+    }
+    g_ngxInitialized = true;
 
-    if (FAILED(NVSDK_NGX_D3D12_GetCapabilityParameters(&g_params))) { vlog("capability params failed"); return 0; }
+    if (FAILED(NVSDK_NGX_D3D12_GetCapabilityParameters(&g_params))) {
+        vlog("capability params failed");
+        cleanupHost(false);
+        return 0;
+    }
     int available = 0;
     g_params->Get(NVSDK_NGX_Parameter_VSR_Available, &available);
-    if (!available) { vlog("VSR.Available=0 (driver/GPU unsupported)"); return 0; }
+    if (!available) {
+        vlog("VSR.Available=0 (driver/GPU unsupported)");
+        cleanupHost(false);
+        return 0;
+    }
 
-    g_cmd->Reset(g_alloc, nullptr);
+    if (!beginCommands()) {
+        cleanupHost(false);
+        return 0;
+    }
     NVSDK_NGX_Feature_Create_Params createParams = {};
     const NVSDK_NGX_Result createResult =
         NGX_D3D12_CREATE_VSR_EXT(g_cmd, 0, 0, &g_feature, g_params, &createParams);
-    if (NVSDK_NGX_FAILED(createResult)) { vlog("create VSR failed 0x%08X", (unsigned)createResult); return 0; }
-    g_cmd->Close();
+    if (NVSDK_NGX_FAILED(createResult)) {
+        vlog("create VSR failed 0x%08X", (unsigned)createResult);
+        g_cmd->Close();
+        cleanupHost(false);
+        return 0;
+    }
+    if (FAILED(g_cmd->Close())) {
+        vlog("feature create command list close failed");
+        cleanupHost(false);
+        return 0;
+    }
     g_queue->ExecuteCommandLists(1, g_lists);
-    flushGpu();
+    if (!flushGpu()) {
+        vlog("feature create GPU flush failed");
+        cleanupHost(false);
+        return 0;
+    }
 
     g_ready = true;
     vlog("VSR host ready");
@@ -261,9 +358,10 @@ extern "C" __declspec(dllexport) int vsr_upscale(const unsigned char* src, int s
         sf.upload->Unmap(0, nullptr);
     }
 
+    if (!beginCommands()) return 0;
+
     const D3D12_RESOURCE_BARRIER b1 =
         transitionBarrier(sf.input, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-    g_cmd->Reset(g_alloc, nullptr);
     g_cmd->ResourceBarrier(1, &b1);
     D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
     dstLoc.pResource = sf.input;
@@ -291,6 +389,9 @@ extern "C" __declspec(dllexport) int vsr_upscale(const unsigned char* src, int s
     const NVSDK_NGX_Result result = NGX_D3D12_EVALUATE_VSR_EXT(g_cmd, g_feature, g_params, &eval);
     if (NVSDK_NGX_FAILED(result)) {
         vlog("evaluate failed 0x%08X (%dx%d -> %dx%d)", (unsigned)result, sw, sh, dw, dh);
+        // Close the recording list before returning. The next call resets both allocator and list,
+        // so a single NGX evaluation failure does not poison the VSR session permanently.
+        g_cmd->Close();
         return 0;
     }
 
@@ -313,9 +414,15 @@ extern "C" __declspec(dllexport) int vsr_upscale(const unsigned char* src, int s
     const D3D12_RESOURCE_BARRIER b4 =
         transitionBarrier(sf.output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     g_cmd->ResourceBarrier(1, &b4);
-    g_cmd->Close();
+    if (FAILED(g_cmd->Close())) {
+        vlog("command list close failed");
+        return 0;
+    }
     g_queue->ExecuteCommandLists(1, g_lists);
-    flushGpu();
+    if (!flushGpu()) {
+        vlog("GPU flush failed");
+        return 0;
+    }
 
     {
         uint8_t* mapped = nullptr;
@@ -328,11 +435,7 @@ extern "C" __declspec(dllexport) int vsr_upscale(const unsigned char* src, int s
 }
 
 extern "C" __declspec(dllexport) void vsr_shutdown() {
-    if (!g_ready) return;
-    releaseSurfaces();
-    NVSDK_NGX_D3D12_Shutdown1(g_device);
-    g_ready = false;
-    vlog("VSR host shutdown");
+    cleanupHost(true);
 }
 
 #ifdef VSR_HOST_TEST
@@ -352,6 +455,7 @@ int main() {
         }
     if (!vsr_upscale(src.data(), sw, sh, dst.data(), dw, dh, 4)) {
         printf("SELFTEST: upscale failed\n");
+        vsr_shutdown();
         return 1;
     }
     double mean = 0;
