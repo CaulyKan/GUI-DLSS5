@@ -634,7 +634,7 @@ fn preview_original(image: RgbaImage, max_side: u32, target: Option<(u32, u32)>)
     }
 }
 
-// 放大到目标尺寸：RTX VSR 推理失败时回退最近邻（放大功能依赖 VSR，不再提供 CPU 放大）
+// 预览放大允许容错：VSR 单帧失败时回退最近邻，并销毁当前 VSR 会话以便下次重建。
 fn upscale_frame(state: &AppState, image: RgbaImage, target: (u32, u32), quality: i32) -> RgbaImage {
     let (tw, th) = target;
     let (w, h) = image.dimensions();
@@ -656,36 +656,75 @@ fn upscale_frame(state: &AppState, image: RgbaImage, target: (u32, u32), quality
                 if let Some(upscaled) = unsafe { host.upscale(&image, tw, th, quality) } {
                     return upscaled;
                 }
-                eprintln!("[DLSS5] RTX VSR 放大失败，本次回退最近邻");
+                eprintln!("[DLSS5] RTX VSR 放大失败，本次预览回退最近邻");
+                drop(slot.take());
             }
         }
     }
     image::imageops::resize(&image, tw, th, FilterType::Nearest)
 }
 
-// 导出用重采样：纯放大仅在启用 RTX VSR 时走 GPU，缩小用 Lanczos3；
-// 未启用 VSR 的放大请求保持在源分辨率（放大功能整体依赖 RTX VSR）
-fn resize_to_target(
+// 正式导出使用严格 VSR：任何初始化/推理失败都返回错误，不允许静默退化为普通插值。
+fn upscale_frame_strict(
+    state: &AppState,
+    image: RgbaImage,
+    target: (u32, u32),
+    quality: i32,
+) -> Result<RgbaImage, String> {
+    let (tw, th) = target;
+    let (w, h) = image.dimensions();
+    if (tw, th) == (w, h) {
+        return Ok(image);
+    }
+    if state.vsr_disabled.load(Ordering::Acquire) {
+        return Err("RTX VSR 当前不可用，已取消导出以避免静默使用普通插值。".into());
+    }
+    let mut slot = state.vsr.lock().map_err(|_| "VSR 会话锁定失败")?;
+    if slot.is_none() {
+        match unsafe { VsrHost::open(&state.root) } {
+            Ok(host) => *slot = Some(host),
+            Err(error) => {
+                state.vsr_disabled.store(true, Ordering::Release);
+                return Err(error);
+            }
+        }
+    }
+    let result = slot
+        .as_ref()
+        .and_then(|host| unsafe { host.upscale(&image, tw, th, quality) });
+    match result {
+        Some(upscaled) => Ok(upscaled),
+        None => {
+            drop(slot.take());
+            Err(format!(
+                "RTX VSR 放大失败（{w}×{h} → {tw}×{th}，质量 {quality}）；导出已停止，没有回退为最近邻。"
+            ))
+        }
+    }
+}
+
+// 导出用重采样：放大必须由 RTX VSR 完成；缩小使用 Lanczos3。
+fn resize_to_target_strict(
     state: &AppState,
     image: RgbaImage,
     target: Option<(u32, u32)>,
     vsr: bool,
     quality: i32,
-) -> RgbaImage {
+) -> Result<RgbaImage, String> {
     let (w, h) = image.dimensions();
     match target {
         Some((tw, th)) if (tw, th) != (w, h) => {
             if tw > w && th > h {
                 if vsr {
-                    upscale_frame(state, image, (tw, th), quality)
+                    upscale_frame_strict(state, image, (tw, th), quality)
                 } else {
-                    image
+                    Err("请求的输出尺寸大于源分辨率，但 RTX VSR 未启用。".into())
                 }
             } else {
-                image::imageops::resize(&image, tw, th, FilterType::Lanczos3)
+                Ok(image::imageops::resize(&image, tw, th, FilterType::Lanczos3))
             }
         }
-        _ => image,
+        _ => Ok(image),
     }
 }
 
@@ -1096,7 +1135,13 @@ async fn save_data_png(
     let vsr = upscale.as_deref() == Some("vsr");
     let quality = vsr_quality.unwrap_or(4);
     let result = image_data_uri(&data).and_then(|image| {
-        let image = resize_to_target(&state, image, sanitize_output(output_width, output_height), vsr, quality);
+        let image = resize_to_target_strict(
+            &state,
+            image,
+            sanitize_output(output_width, output_height),
+            vsr,
+            quality,
+        )?;
         image.save(&destination).map_err(|e| e.to_string())
     });
     finish_export_progress(&state, &result, u32::from(result.is_ok()));
@@ -1133,13 +1178,13 @@ async fn save_png(
         let image = image::open(&path)
             .map_err(|e| format!("无法读取图片: {e}"))?
             .to_rgba8();
-        let image = resize_to_target(
+        let image = resize_to_target_strict(
             &state,
             image,
             sanitize_output(output_width, output_height),
             settings.upscale == "vsr",
             settings.vsr_quality,
-        );
+        )?;
         let (w, h) = image.dimensions();
         let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
         if host.is_none() {
@@ -1507,9 +1552,18 @@ async fn export_video(
                 };
                 let data: Vec<u8> = if bypass {
                     match RgbaImage::from_raw(decode_w, decode_h, frame) {
-                        Some(image) => {
-                            upscale_frame(&state, image, (w, h), settings.vsr_quality).into_raw()
-                        }
+                        Some(image) => match upscale_frame_strict(
+                            &state,
+                            image,
+                            (w, h),
+                            settings.vsr_quality,
+                        ) {
+                            Ok(upscaled) => upscaled.into_raw(),
+                            Err(error) => {
+                                outcome = Err(error);
+                                break;
+                            }
+                        },
                         None => {
                             outcome = Err("无效视频帧".into());
                             break;
