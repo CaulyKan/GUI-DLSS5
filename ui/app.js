@@ -5,7 +5,7 @@ let runtimeReady = Promise.resolve();
 const state = { path:null, sourcePath:null, kind:null, info:null, sourceData:null, originalUrl:null, processedUrl:null, loadedFrame:-1, zoom:1, fit:1, panX:0, panY:0, splitX:null, dragging:null, request:0, busy:false };
 const stage = $('stage'), preview = $('preview'), originalPreview = $('original-preview'), originalMask = $('original-mask'), abView = $('ab-view');
 const abPanes = Array.from(abView.querySelectorAll('.ab-pane')), abOriginal = $('ab-original'), abProcessed = $('ab-processed');
-const settings = () => ({ style:+$('style').value, intensity:+$('intensity').value, localTone:+$('tone').value, localStruct:+$('struct').value, skinStructure:+$('skin').value, useAutoMask:$('auto-mask').checked, uiCorrection:$('ui-correction').checked, outputView:0, outputMix:1, upscale:$('upscale').value, vsrQuality:+$('vsr-quality').value, encoder:$('encoder').value, encoderQuality:+$('encoder-quality').value, keepAudio:$('keep-audio').checked });
+const settings = () => ({ multiPass:$('multi-pass').checked, passCount:+$('pass-count').value, style:+$('style').value, intensity:+$('intensity').value, localTone:+$('tone').value, localStruct:+$('struct').value, skinStructure:+$('skin').value, useAutoMask:$('auto-mask').checked, uiCorrection:$('ui-correction').checked, outputView:0, outputMix:1, upscale:$('upscale').value, vsrQuality:+$('vsr-quality').value, encoder:$('encoder').value, encoderQuality:+$('encoder-quality').value, keepAudio:$('keep-audio').checked });
 const upscaleArgs = () => ({ upscale:$('upscale').value, vsrQuality:+$('vsr-quality').value });
 function log(message) { console.debug(`[DLSS5] ${message}`); }
 function status(message) { $('status').textContent = message; }
@@ -17,6 +17,15 @@ function revokeMedia() { deferRevoke(state.originalUrl); deferRevoke(state.proce
 function syncControls(range, number) { $(range).oninput = () => { $(number).value = $(range).value; refresh(); }; $(number).onchange = () => { $(range).value = Math.max(0, Math.min(1, +$(number).value || 0)); refresh(); }; }
 syncControls('intensity','intensity-num'); syncControls('tone','tone-num'); syncControls('struct','struct-num'); syncControls('skin','skin-num');
 $('auto-mask').onchange=()=>refresh(); $('ui-correction').onchange=()=>refresh();
+$('multi-pass').onchange=()=>{ $('pass-control').hidden=!$('multi-pass').checked; refresh(); };
+function syncPassCount(value) {
+  const count=Math.max(1,Math.min(5,Math.round(Number(value)||1)));
+  $('pass-count').value=count;
+  $('pass-count-num').value=count;
+  refresh();
+}
+$('pass-count').oninput=()=>syncPassCount($('pass-count').value);
+$('pass-count-num').onchange=()=>syncPassCount($('pass-count-num').value);
 // 输出尺寸：自定义长宽 + X1/X2/X4 快速倍率；32..8192 且取偶（视频编码要求）
 // 放大功能整体依赖 RTX VSR：关闭或不可用时输出不能超过原始分辨率
 const OUTPUT_MIN_SIDE=32, OUTPUT_MAX_SIDE=8192;

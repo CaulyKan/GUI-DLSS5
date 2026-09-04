@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod passes;
+
 use base64::{engine::general_purpose::STANDARD, Engine};
 use image::{
     codecs::png::PngEncoder, imageops::FilterType, ExtendedColorType, ImageEncoder, RgbaImage,
@@ -37,6 +39,8 @@ type ShutdownFn = unsafe extern "C" fn();
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
 struct RenderSettings {
+    multi_pass: bool,
+    pass_count: i32,
     style: i32,
     intensity: f32,
     local_tone: f32,
@@ -56,6 +60,8 @@ struct RenderSettings {
 impl Default for RenderSettings {
     fn default() -> Self {
         Self {
+            multi_pass: false,
+            pass_count: 2,
             style: 0,
             intensity: 1.0,
             local_tone: 1.0,
@@ -125,6 +131,7 @@ struct Host {
     motion: Vec<f32>,
     depth: Vec<f32>,
     output: Vec<u8>,
+    pass_input: Vec<u8>,
     ready: bool,
 }
 
@@ -164,6 +171,7 @@ impl Host {
             motion: Vec::new(),
             depth: Vec::new(),
             output: Vec::new(),
+            pass_input: Vec::new(),
             ready: false,
         })
     }
@@ -242,16 +250,30 @@ impl Host {
         if input.len() != self.output.len() {
             return Err("帧数据长度与 DLSS 会话不符。".into());
         }
-        if (self.process)(
-            input.as_ptr() as *mut u8,
-            self.motion.as_mut_ptr(),
-            self.depth.as_mut_ptr(),
-            self.output.as_mut_ptr(),
-            i32::from(reset),
-        ) == 0
-        {
-            return Err("DLSS 未生成画面。".into());
-        }
+        let pass_count = if settings.multi_pass {
+            settings.pass_count
+        } else {
+            1
+        };
+        let process = self.process;
+        let motion = self.motion.as_mut_ptr();
+        let depth = self.depth.as_mut_ptr();
+        passes::process_passes(
+            input,
+            &mut self.output,
+            &mut self.pass_input,
+            pass_count,
+            reset,
+            |source, destination, reset| {
+                process(
+                    source.as_ptr() as *mut u8,
+                    motion,
+                    depth,
+                    destination.as_mut_ptr(),
+                    i32::from(reset),
+                ) != 0
+            },
+        )?;
         Ok(self.output.as_slice())
     }
 }
@@ -1681,12 +1703,22 @@ fn main() {
             .iter()
             .find_map(|arg| arg.strip_prefix("--runtime="))
             .unwrap_or("50");
-        let settings = RenderSettings::default();
+        let pass_count = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--passes="))
+            .map(|value| value.parse::<i32>().expect("--passes 必须为整数"))
+            .unwrap_or(1)
+            .clamp(1, 5);
+        let settings = RenderSettings {
+            multi_pass: pass_count > 1,
+            pass_count,
+            ..RenderSettings::default()
+        };
         let mut host = unsafe { Host::load(&root, runtime) }.expect("无法加载 DLSS 宿主");
         let input = vec![128_u8; 640 * 360 * 4];
         match unsafe { host.render(&root, runtime, &input, 640, 360, &settings, true) } {
             Ok(output) if output.len() == 640 * 360 * 4 => {
-                println!("DLSS_SELFTEST_OK RTX{runtime}");
+                println!("DLSS_SELFTEST_OK RTX{runtime} passes={pass_count}");
                 return;
             }
             Ok(_) => panic!("DLSS 自检返回了错误的帧长度"),
