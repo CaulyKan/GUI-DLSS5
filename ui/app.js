@@ -1,6 +1,11 @@
 const invoke = window.__TAURI__.core.invoke;
 const $ = id => document.getElementById(id);
-const PREVIEW_MAX_SIDE = 2160;
+const DEFAULT_RENDER_SETTINGS = { style:2, skinStructure:0.1, useAutoMask:true };
+$('style').value = DEFAULT_RENDER_SETTINGS.style;
+$('skin').value = $('skin-num').value = DEFAULT_RENDER_SETTINGS.skinStructure;
+$('auto-mask').checked = DEFAULT_RENDER_SETTINGS.useAutoMask;
+const PREVIEW_MAX_SIDE = 4520;
+$('out-width').parentElement.title = `自定义输出分辨率；预览横竖任一单边最高 ${PREVIEW_MAX_SIDE}，导出按此尺寸处理`;
 let runtimeReady = Promise.resolve();
 const state = { path:null, sourcePath:null, kind:null, info:null, sourceData:null, originalUrl:null, processedUrl:null, loadedFrame:-1, zoom:1, fit:1, panX:0, panY:0, splitX:null, dragging:null, request:0, busy:false };
 const stage = $('stage'), preview = $('preview'), originalPreview = $('original-preview'), originalMask = $('original-mask'), abView = $('ab-view');

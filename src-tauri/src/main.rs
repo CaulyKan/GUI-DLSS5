@@ -26,7 +26,7 @@ use tauri::{ipc::Response, Manager};
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const PREVIEW_CACHE_FRAMES: usize = 12;
 const SEQUENTIAL_DECODE_LIMIT: u32 = 90;
-const MAX_PREVIEW_SIDE: u32 = 2160;
+const MAX_PREVIEW_SIDE: u32 = 4520;
 
 type InitFn = unsafe extern "C" fn(i32, i32, i32, *const u16, *const u16) -> i32;
 type CreateFn = unsafe extern "C" fn(i32, i32, i32) -> i32;
@@ -62,12 +62,12 @@ impl Default for RenderSettings {
         Self {
             multi_pass: false,
             pass_count: 2,
-            style: 0,
+            style: 2,
             intensity: 1.0,
             local_tone: 1.0,
             local_struct: 1.0,
-            skin_structure: 1.0,
-            use_auto_mask: false,
+            skin_structure: 0.1,
+            use_auto_mask: true,
             ui_correction: false,
             output_view: 0,
             output_mix: 1.0,
