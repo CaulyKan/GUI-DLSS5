@@ -616,6 +616,26 @@ fn sanitize_output(width: Option<u32>, height: Option<u32>) -> Option<(u32, u32)
     Some((w & !1, h & !1))
 }
 
+fn preview_target_dimensions_for_size(
+    width: u32,
+    height: u32,
+    max_side: u32,
+    target: Option<(u32, u32)>,
+) -> (u32, u32) {
+    target
+        .map(|(w, h)| preview_dimensions(w, h, max_side))
+        .unwrap_or_else(|| preview_dimensions(width, height, max_side))
+}
+
+fn preview_target_dimensions(
+    image: &RgbaImage,
+    max_side: u32,
+    target: Option<(u32, u32)>,
+) -> (u32, u32) {
+    let (width, height) = image.dimensions();
+    preview_target_dimensions_for_size(width, height, max_side, target)
+}
+
 // DLSS 侧预览帧：纯放大且启用 RTX VSR 时走 GPU 网络超分；
 // 放大功能仅在 VSR 可用时开放，未启用 VSR 的放大请求保持在源分辨率
 fn prepare_preview(
@@ -626,12 +646,7 @@ fn prepare_preview(
     vsr: bool,
     quality: i32,
 ) -> RgbaImage {
-    let (tw, th) = target
-        .map(|(w, h)| preview_dimensions(w, h, max_side))
-        .unwrap_or_else(|| {
-            let (w, h) = image.dimensions();
-            preview_dimensions(w, h, max_side)
-        });
+    let (tw, th) = preview_target_dimensions(&image, max_side, target);
     let (w, h) = image.dimensions();
     if (tw, th) == (w, h) {
         return image;
@@ -648,12 +663,7 @@ fn prepare_preview(
 
 // 原图侧预览帧：放大使用最近邻（诚实的像素放大，不添加任何信息），缩小用 CatmullRom
 fn preview_original(image: RgbaImage, max_side: u32, target: Option<(u32, u32)>) -> RgbaImage {
-    let (tw, th) = target
-        .map(|(w, h)| preview_dimensions(w, h, max_side))
-        .unwrap_or_else(|| {
-            let (w, h) = image.dimensions();
-            preview_dimensions(w, h, max_side)
-        });
+    let (tw, th) = preview_target_dimensions(&image, max_side, target);
     let (w, h) = image.dimensions();
     if (tw, th) == (w, h) {
         return image;
@@ -767,6 +777,79 @@ fn resize_to_target_strict(
         }
         _ => Ok(image),
     }
+}
+
+fn active_pass_count(settings: &RenderSettings) -> i32 {
+    if settings.multi_pass {
+        settings.pass_count.clamp(1, 5)
+    } else {
+        1
+    }
+}
+
+fn should_defer_vsr_until_after_first_pass(
+    settings: &RenderSettings,
+    source: (u32, u32),
+    target: Option<(u32, u32)>,
+) -> bool {
+    matches!(target, Some((tw, th)) if settings.upscale == "vsr" && active_pass_count(settings) > 1 && tw > source.0 && th > source.1)
+}
+
+fn render_dlss_frame(
+    state: &AppState,
+    runtime: &str,
+    image: RgbaImage,
+    settings: &RenderSettings,
+    reset: bool,
+) -> Result<RgbaImage, String> {
+    let (w, h) = image.dimensions();
+    let input = image.into_raw();
+    let output = {
+        let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
+        if host.is_none() {
+            *host = Some(unsafe { Host::load(&state.root, runtime)? });
+        }
+        unsafe {
+            host.as_mut()
+                .unwrap()
+                .render(&state.root, runtime, &input, w, h, settings, reset)?
+                .to_vec()
+        }
+    };
+    RgbaImage::from_raw(w, h, output).ok_or("无效 DLSS 输出".into())
+}
+
+fn render_with_pass_order(
+    state: &AppState,
+    runtime: &str,
+    image: RgbaImage,
+    settings: &RenderSettings,
+    reset: bool,
+    post_first_vsr_target: Option<(u32, u32)>,
+    strict_vsr: bool,
+) -> Result<RgbaImage, String> {
+    let pass_count = active_pass_count(settings);
+    let Some(target) = post_first_vsr_target else {
+        return render_dlss_frame(state, runtime, image, settings, reset);
+    };
+    if pass_count == 1 {
+        return render_dlss_frame(state, runtime, image, settings, reset);
+    }
+
+    let mut first_pass = settings.clone();
+    first_pass.multi_pass = false;
+    first_pass.pass_count = 1;
+    let first_output = render_dlss_frame(state, runtime, image, &first_pass, true)?;
+    let upscaled = if strict_vsr {
+        upscale_frame_strict(state, first_output, target, settings.vsr_quality)?
+    } else {
+        upscale_frame(state, first_output, target, settings.vsr_quality)
+    };
+    let remaining = pass_count - 1;
+    let mut remaining_passes = settings.clone();
+    remaining_passes.multi_pass = remaining > 1;
+    remaining_passes.pass_count = remaining;
+    render_dlss_frame(state, runtime, upscaled, &remaining_passes, true)
 }
 
 fn spawn_decoder(
@@ -975,26 +1058,28 @@ fn process_rgba(
     max_side: u32,
     target: Option<(u32, u32)>,
 ) -> Result<Vec<u8>, String> {
+    let vsr_target = preview_target_dimensions(&image, max_side, target);
+    let defer_vsr =
+        should_defer_vsr_until_after_first_pass(&settings, image.dimensions(), Some(vsr_target));
     let image = prepare_preview(
         state,
         image,
         max_side,
         target,
-        settings.upscale == "vsr",
+        settings.upscale == "vsr" && !defer_vsr,
         settings.vsr_quality,
     );
-    let (w, h) = image.dimensions();
-    let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
-    if host.is_none() {
-        *host = Some(unsafe { Host::load(&state.root, &runtime)? });
-    }
-    let input = image.into_raw();
-    let rendered = unsafe {
-        host.as_mut()
-            .unwrap()
-            .render(&state.root, &runtime, &input, w, h, &settings, true)?
-    };
-    rgba_png(rendered, w, h)
+    let rendered = render_with_pass_order(
+        state,
+        &runtime,
+        image,
+        &settings,
+        true,
+        defer_vsr.then_some(vsr_target),
+        false,
+    )?;
+    let (w, h) = rendered.dimensions();
+    rgba_png(&rendered.into_raw(), w, h)
 }
 
 #[tauri::command]
@@ -1231,26 +1316,31 @@ async fn save_png(
         let image = image::open(&path)
             .map_err(|e| format!("无法读取图片: {e}"))?
             .to_rgba8();
-        let image = resize_to_target_strict(
-            &state,
-            image,
-            sanitize_output(output_width, output_height),
-            settings.upscale == "vsr",
-            settings.vsr_quality,
-        )?;
-        let (w, h) = image.dimensions();
-        let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
-        if host.is_none() {
-            *host = Some(unsafe { Host::load(&state.root, &runtime)? });
-        }
-        let input = image.into_raw();
-        let out = unsafe {
-            host.as_mut()
-                .unwrap()
-                .render(&state.root, &runtime, &input, w, h, &settings, true)?
+        let target = sanitize_output(output_width, output_height);
+        let defer_vsr =
+            should_defer_vsr_until_after_first_pass(&settings, image.dimensions(), target);
+        let image = if defer_vsr {
+            image
+        } else {
+            resize_to_target_strict(
+                &state,
+                image,
+                target,
+                settings.upscale == "vsr",
+                settings.vsr_quality,
+            )?
         };
-        RgbaImage::from_raw(w, h, out.to_vec())
-            .ok_or("无效输出")?
+        let post_first_vsr_target = if defer_vsr { target } else { None };
+        let rendered = render_with_pass_order(
+            &state,
+            &runtime,
+            image,
+            &settings,
+            true,
+            post_first_vsr_target,
+            true,
+        )?;
+        rendered
             .save(&destination)
             .map_err(|e| format!("无法写入 PNG: {e}"))?;
         Ok(())
@@ -1259,8 +1349,8 @@ async fn save_png(
     result
 }
 
-// 解码后按需把帧升到预览目标尺寸：原图侧（nearest）用最近邻，DLSS 侧走 RTX VSR；
-// 两种模式在放大时都让解码保持源分辨率
+// 解码后按需把帧升到预览目标尺寸：原图侧（nearest）用最近邻，单 Pass 的 DLSS 侧走 RTX VSR；
+// 多重 Pass 则保留源分辨率，交由调用方在第 1 次 DLSS 后执行 VSR。
 #[allow(clippy::too_many_arguments)]
 fn decoded_preview_frame(
     state: &AppState,
@@ -1269,21 +1359,28 @@ fn decoded_preview_frame(
     max_side: u32,
     target: Option<(u32, u32)>,
     vsr: bool,
+    defer_vsr: bool,
     nearest: bool,
     quality: i32,
 ) -> Result<RgbaImage, String> {
-    let (bytes, dw, dh) =
-        decode_video_frame(&state, path, frame, max_side, target, vsr || nearest)?;
+    let (bytes, dw, dh) = decode_video_frame(
+        &state,
+        path,
+        frame,
+        max_side,
+        target,
+        vsr || defer_vsr || nearest,
+    )?;
     let image = RgbaImage::from_raw(dw, dh, bytes).ok_or("无效视频帧")?;
-    let (pw, ph) = target
-        .map(|(w, h)| preview_dimensions(w, h, max_side))
-        .unwrap_or((dw, dh));
+    let (pw, ph) = preview_target_dimensions_for_size(dw, dh, max_side, target);
     if (dw, dh) == (pw, ph) {
         return Ok(image);
     }
     if pw > dw && ph > dh {
         if nearest {
             Ok(image::imageops::resize(&image, pw, ph, FilterType::Nearest))
+        } else if defer_vsr {
+            Ok(image)
         } else {
             Ok(upscale_frame(state, image, (pw, ph), quality))
         }
@@ -1313,6 +1410,7 @@ async fn frame_png(
         max_side,
         sanitize_output(output_width, output_height),
         false,
+        false,
         true,
         0,
     )?;
@@ -1331,33 +1429,39 @@ async fn render_frame_png(
     output_width: Option<u32>,
     output_height: Option<u32>,
 ) -> Result<Response, String> {
+    let target = sanitize_output(output_width, output_height);
+    let (source_w, source_h) = state
+        .media
+        .lock()
+        .map_err(|_| "媒体信息锁定失败")?
+        .get(&path)
+        .map(|info| (info.width, info.height))
+        .ok_or("媒体尚未载入")?;
+    let vsr_target = preview_target_dimensions_for_size(source_w, source_h, max_side, target);
+    let defer_vsr =
+        should_defer_vsr_until_after_first_pass(&settings, (source_w, source_h), Some(vsr_target));
     let image = decoded_preview_frame(
         &state,
         &path,
         frame,
         max_side,
-        sanitize_output(output_width, output_height),
+        target,
         settings.upscale == "vsr",
+        defer_vsr,
         false,
         settings.vsr_quality,
     )?;
-    let (w, h) = image.dimensions();
-    let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
-    if host.is_none() {
-        *host = Some(unsafe { Host::load(&state.root, &runtime)? });
-    }
-    let rendered = unsafe {
-        host.as_mut().unwrap().render(
-            &state.root,
-            &runtime,
-            &image.into_raw(),
-            w,
-            h,
-            &settings,
-            true,
-        )?
-    };
-    Ok(Response::new(rgba_png(rendered, w, h)?))
+    let rendered = render_with_pass_order(
+        &state,
+        &runtime,
+        image,
+        &settings,
+        true,
+        defer_vsr.then_some(vsr_target),
+        false,
+    )?;
+    let (w, h) = rendered.dimensions();
+    Ok(Response::new(rgba_png(&rendered.into_raw(), w, h)?))
 }
 
 // ffmpeg stderr 留尾：去掉空字节，最多保留末尾 400 字符
@@ -1453,6 +1557,7 @@ async fn export_video(
     }
     // VSR 模式且在放大时：解码保持源分辨率，放大交给 GPU，其余交给 FFmpeg scale
     let bypass = vsr_mode && w > source_w && h > source_h;
+    let defer_vsr = bypass && active_pass_count(&settings) > 1;
     let (decode_w, decode_h) = if bypass { (source_w, source_h) } else { (w, h) };
     let quality = settings.encoder_quality.clamp(0, 51);
     let quality_s = quality.to_string();
@@ -1602,70 +1707,60 @@ async fn export_video(
         });
         let mut count = 0;
         let mut outcome: Result<u32, String> = Ok(0);
-        {
-            let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
-            if host.is_none() {
-                *host = Some(unsafe { Host::load(&state.root, &runtime)? });
-            }
-            for message in rx {
-                let frame = match message {
-                    Ok(frame) => frame,
-                    Err(e) => {
-                        outcome = Err(e);
-                        break;
-                    }
-                };
-                let data: Vec<u8> = if bypass {
-                    match RgbaImage::from_raw(decode_w, decode_h, frame) {
-                        Some(image) => {
-                            match upscale_frame_strict(&state, image, (w, h), settings.vsr_quality)
-                            {
-                                Ok(upscaled) => upscaled.into_raw(),
-                                Err(error) => {
-                                    outcome = Err(error);
-                                    break;
-                                }
-                            }
-                        }
-                        None => {
-                            outcome = Err("无效视频帧".into());
-                            break;
-                        }
-                    }
-                } else {
-                    frame
-                };
-                let rendered = match unsafe {
-                    host.as_mut().unwrap().render(
-                        &state.root,
-                        &runtime,
-                        &data,
-                        w,
-                        h,
-                        &settings,
-                        count == 0,
-                    )
-                } {
-                    Ok(rendered) => rendered,
-                    Err(e) => {
-                        outcome = Err(e);
-                        break;
-                    }
-                };
-                if let Err(e) = writer.write_all(rendered) {
-                    outcome = Err(format!("视频编码写入失败: {e}"));
+        for message in rx {
+            let frame = match message {
+                Ok(frame) => frame,
+                Err(e) => {
+                    outcome = Err(e);
                     break;
                 }
-                count += 1;
-                current = count;
-                set_export_progress(
-                    &state,
-                    true,
-                    current,
-                    total_frames,
-                    format!("正在导出第 {current} / {total_frames} 帧"),
-                );
+            };
+            let image = match RgbaImage::from_raw(decode_w, decode_h, frame) {
+                Some(image) => image,
+                None => {
+                    outcome = Err("无效视频帧".into());
+                    break;
+                }
+            };
+            let image = if bypass && !defer_vsr {
+                match upscale_frame_strict(&state, image, (w, h), settings.vsr_quality) {
+                    Ok(upscaled) => upscaled,
+                    Err(error) => {
+                        outcome = Err(error);
+                        break;
+                    }
+                }
+            } else {
+                image
+            };
+            let rendered = match render_with_pass_order(
+                &state,
+                &runtime,
+                image,
+                &settings,
+                count == 0,
+                defer_vsr.then_some((w, h)),
+                true,
+            ) {
+                Ok(rendered) => rendered,
+                Err(error) => {
+                    outcome = Err(error);
+                    break;
+                }
+            };
+            if let Err(e) = writer.write_all(&rendered.into_raw()) {
+                outcome = Err(format!("视频编码写入失败: {e}"));
+                break;
             }
+            count += 1;
+            current = count;
+            set_export_progress(
+                &state,
+                true,
+                current,
+                total_frames,
+                format!("正在导出第 {current} / {total_frames} 帧"),
+            );
         }
         let _ = reader_thread.join();
         drop(writer);
@@ -1693,6 +1788,40 @@ async fn export_video(
     })();
     finish_export_progress(&state, &result, current);
     result
+}
+
+#[cfg(test)]
+mod render_order_tests {
+    use super::*;
+
+    #[test]
+    fn defers_vsr_only_for_a_real_multi_pass_upscale() {
+        let mut settings = RenderSettings {
+            multi_pass: true,
+            pass_count: 3,
+            ..RenderSettings::default()
+        };
+        assert!(should_defer_vsr_until_after_first_pass(
+            &settings,
+            (1920, 1080),
+            Some((3840, 2160)),
+        ));
+
+        settings.pass_count = 1;
+        assert!(!should_defer_vsr_until_after_first_pass(
+            &settings,
+            (1920, 1080),
+            Some((3840, 2160)),
+        ));
+
+        settings.pass_count = 3;
+        settings.upscale = "none".into();
+        assert!(!should_defer_vsr_until_after_first_pass(
+            &settings,
+            (1920, 1080),
+            Some((3840, 2160)),
+        ));
+    }
 }
 
 fn main() {
