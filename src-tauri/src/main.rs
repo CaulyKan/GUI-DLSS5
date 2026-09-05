@@ -73,7 +73,7 @@ impl Default for RenderSettings {
             output_mix: 1.0,
             upscale: "vsr".into(),
             vsr_quality: 4,
-            encoder: "h264_nvenc".into(),
+            encoder: "h265_nvenc".into(),
             encoder_quality: 23,
             keep_audio: true,
         }
@@ -372,6 +372,8 @@ struct AppState {
     drop_active: AtomicBool,
     pending_drop_paths: Mutex<Vec<PathBuf>>,
     export_progress: Mutex<ExportProgress>,
+    export_paused: AtomicBool,
+    export_cancel: AtomicBool,
 }
 
 struct VideoDecoder {
@@ -481,6 +483,8 @@ fn begin_export_progress(state: &AppState, total: u32) -> Result<(), String> {
         total: total.max(1),
         message: "准备导出…".into(),
     };
+    state.export_paused.store(false, Ordering::Release);
+    state.export_cancel.store(false, Ordering::Release);
     Ok(())
 }
 
@@ -1163,6 +1167,28 @@ fn poll_export_progress(state: tauri::State<'_, AppState>) -> Result<ExportProgr
 }
 
 #[tauri::command]
+fn export_set_paused(state: tauri::State<'_, AppState>, paused: bool) -> Result<(), String> {
+    state.export_paused.store(paused, Ordering::Release);
+    if let Ok(mut progress) = state.export_progress.lock() {
+        if progress.active {
+            progress.message = if paused {
+                "已暂停".into()
+            } else {
+                "正在继续导出…".into()
+            };
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn export_cancel(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.export_cancel.store(true, Ordering::Release);
+    state.export_paused.store(false, Ordering::Release);
+    Ok(())
+}
+
+#[tauri::command]
 async fn media_info(state: tauri::State<'_, AppState>, path: String) -> Result<MediaInfo, String> {
     let source_path = path;
     let path_buf = PathBuf::from(&source_path);
@@ -1588,6 +1614,7 @@ async fn export_video(
         format!("使用 {label}，正在导出 {w}×{h}…"),
     );
     let mut current = 0;
+    let mut cancelled = false;
     let result: Result<u32, String> = (|| {
         let frame_bytes = (decode_w * decode_h * 4) as usize;
         let scale_filter = format!("scale={w}:{h}:flags=lanczos");
@@ -1708,6 +1735,21 @@ async fn export_video(
         let mut count = 0;
         let mut outcome: Result<u32, String> = Ok(0);
         for message in rx {
+            if state.export_cancel.load(Ordering::Acquire) {
+                cancelled = true;
+                outcome = Err("导出已取消".into());
+                break;
+            }
+            while state.export_paused.load(Ordering::Acquire)
+                && !state.export_cancel.load(Ordering::Acquire)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+            if state.export_cancel.load(Ordering::Acquire) {
+                cancelled = true;
+                outcome = Err("导出已取消".into());
+                break;
+            }
             let frame = match message {
                 Ok(frame) => frame,
                 Err(e) => {
@@ -1777,16 +1819,23 @@ async fn export_video(
             outcome = Err(format!("FFmpeg 编码失败。{encode_tail}"));
         }
         if let Err(message) = outcome.as_mut() {
-            if !encode_tail.is_empty() && !message.contains("编码器输出") {
+            if !cancelled && !encode_tail.is_empty() && !message.contains("编码器输出") {
                 message.push_str(&format!("；编码器输出: {encode_tail}"));
             }
         }
         if outcome.is_ok() {
             outcome = Ok(count);
         }
+        if cancelled {
+            let _ = std::fs::remove_file(&destination);
+        }
         outcome
     })();
-    finish_export_progress(&state, &result, current);
+    if cancelled {
+        set_export_progress(&state, false, current, total_frames, "导出已取消".into());
+    } else {
+        finish_export_progress(&state, &result, current);
+    }
     result
 }
 
@@ -1901,6 +1950,8 @@ fn main() {
                     total: 1,
                     message: String::new(),
                 }),
+                export_paused: AtomicBool::new(false),
+                export_cancel: AtomicBool::new(false),
             });
             Ok(())
         })
@@ -1910,6 +1961,8 @@ fn main() {
             gpu_info,
             poll_drop,
             poll_export_progress,
+            export_set_paused,
+            export_cancel,
             media_info,
             read_image_data,
             process_image,
