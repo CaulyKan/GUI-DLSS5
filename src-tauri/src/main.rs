@@ -50,6 +50,10 @@ struct RenderSettings {
     ui_correction: bool,
     output_view: i32,
     output_mix: f32,
+    brightness: f32,
+    contrast: f32,
+    saturation: f32,
+    post_per_pass: bool,
     upscale: String,
     vsr_quality: i32,
     encoder: String,
@@ -71,6 +75,10 @@ impl Default for RenderSettings {
             ui_correction: false,
             output_view: 0,
             output_mix: 1.0,
+            brightness: 1.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            post_per_pass: true,
             upscale: "vsr".into(),
             vsr_quality: 4,
             encoder: "h265_nvenc".into(),
@@ -824,6 +832,29 @@ fn render_dlss_frame(
     RgbaImage::from_raw(w, h, output).ok_or("无效 DLSS 输出".into())
 }
 
+/// 亮度/对比度/饱和度后处理：对 RGBA8 图像做逐像素调整。
+fn post_process(image: &mut RgbaImage, brightness: f32, contrast: f32, saturation: f32) {
+    // 三个参数均为默认值时跳过逐像素处理，避免不必要的开销
+    if (brightness - 1.0).abs() < f32::EPSILON
+        && (contrast - 1.0).abs() < f32::EPSILON
+        && (saturation - 1.0).abs() < f32::EPSILON
+    {
+        return;
+    }
+    let bo = brightness - 1.0;
+    for px in image.pixels_mut() {
+        let ch = &mut px.0;
+        let luma = 0.299 * ch[0] as f32 + 0.587 * ch[1] as f32 + 0.114 * ch[2] as f32;
+        for c in 0..3 {
+            let mut v = ch[c] as f32;
+            v = luma + (v - luma) * saturation;
+            v = (v - 128.0) * contrast + 128.0;
+            v += bo * 255.0;
+            ch[c] = v.clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
 fn render_with_pass_order(
     state: &AppState,
     runtime: &str,
@@ -834,17 +865,32 @@ fn render_with_pass_order(
     strict_vsr: bool,
 ) -> Result<RgbaImage, String> {
     let pass_count = active_pass_count(settings);
+    let post = |img: &mut RgbaImage| {
+        post_process(
+            img,
+            settings.brightness,
+            settings.contrast,
+            settings.saturation,
+        );
+    };
     let Some(target) = post_first_vsr_target else {
-        return render_dlss_frame(state, runtime, image, settings, reset);
+        let mut result = render_dlss_frame(state, runtime, image, settings, reset)?;
+        post(&mut result);
+        return Ok(result);
     };
     if pass_count == 1 {
-        return render_dlss_frame(state, runtime, image, settings, reset);
+        let mut result = render_dlss_frame(state, runtime, image, settings, reset)?;
+        post(&mut result);
+        return Ok(result);
     }
 
     let mut first_pass = settings.clone();
     first_pass.multi_pass = false;
     first_pass.pass_count = 1;
-    let first_output = render_dlss_frame(state, runtime, image, &first_pass, true)?;
+    let mut first_output = render_dlss_frame(state, runtime, image, &first_pass, true)?;
+    if settings.post_per_pass {
+        post(&mut first_output);
+    }
     let upscaled = if strict_vsr {
         upscale_frame_strict(state, first_output, target, settings.vsr_quality)?
     } else {
@@ -854,7 +900,10 @@ fn render_with_pass_order(
     let mut remaining_passes = settings.clone();
     remaining_passes.multi_pass = remaining > 1;
     remaining_passes.pass_count = remaining;
-    render_dlss_frame(state, runtime, upscaled, &remaining_passes, true)
+    let mut result = render_dlss_frame(state, runtime, upscaled, &remaining_passes, true)?;
+    // 末轮始终应用：post_per_pass 关闭时仅在这里应用一次
+    post(&mut result);
+    Ok(result)
 }
 
 fn spawn_decoder(
